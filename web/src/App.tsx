@@ -1,0 +1,94 @@
+import { useEffect, useState } from "react"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { useAuthMini } from "auth-mini-react-components"
+import { LinkitProvider, useLinkit } from "linkit-react-components"
+import { Navigate, Route, Routes, useLocation } from "react-router-dom"
+import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, LayoutDashboardIcon, RefreshCwIcon } from "lucide-react"
+import { AppLayout, type AppNavGroup } from "@zccz14/ux"
+
+import { FirmamentMark } from "./components/firmament-mark"
+import { LanguageMenu } from "./components/language-menu"
+import { ThemeSwitcher } from "./components/theme-switcher"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Toaster } from "@/components/ui/sonner"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import { request, type AuthSdk } from "./lib/api"
+import { copy, initialLocale, localeStorageKey, negotiateLocale, type Copy, type Locale } from "./lib/i18n"
+import type { Me } from "./lib/types"
+import { DatasetsPage } from "./pages/datasets-page"
+import { LinkitPage } from "./pages/linkit-page"
+import { OverviewPage } from "./pages/overview-page"
+import { SetupPage } from "./pages/setup-page"
+import { SyncPage } from "./pages/sync-page"
+import { SystemResourcesPage } from "./pages/system-resources-page"
+
+export default function App() {
+  const { isReady, isAuthenticated, sdk } = useAuthMini()
+  const [locale, setLocale] = useState<Locale>(initialLocale)
+  const t = copy[locale]
+  if (!isReady || !isAuthenticated || !sdk) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{t.signin}</div>
+  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><FirmamentShell auth={sdk} locale={locale} setLocale={setLocale} t={t} /></LinkitProvider>
+}
+
+function FirmamentShell({ auth, locale, setLocale, t }: { auth: AuthSdk; locale: Locale; setLocale: (locale: Locale) => void; t: Copy }) {
+  const { languages } = useLinkit()
+  useEffect(() => {
+    if (window.localStorage.getItem(localeStorageKey) !== null) return
+    const next = negotiateLocale(languages)
+    if (next) setLocale(next)
+  }, [languages, setLocale])
+  const queryClient = useQueryClient()
+  const location = useLocation()
+  const me = useQuery({ queryKey: ["me"], queryFn: () => request<Me>("/api/v1/me", auth) })
+  const refresh = () => void queryClient.invalidateQueries()
+  if (me.isPending || !me.data) return <div className="grid min-h-svh place-items-center"><Skeleton className="h-8 w-48" /></div>
+  if (me.error) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{me.error.message}</div>
+  if (me.data.setup_required && location.pathname !== "/setup") return <Navigate to="/setup" replace />
+  if (!me.data.setup_required && location.pathname === "/setup") return <Navigate to="/" replace />
+
+  const nav: AppNavGroup[] = [
+    {
+      label: t.navWorkspace,
+      items: [
+        { to: "/", label: t.overview, icon: <LayoutDashboardIcon /> },
+        { to: "/datasets", label: t.datasets, icon: <DatabaseIcon /> },
+        { to: "/sync", label: t.sync, icon: <HardDriveDownloadIcon /> },
+        { to: "/linkit", label: t.linkit, icon: <BotIcon /> },
+      ],
+    },
+    ...(me.data.is_root ? [{ label: t.navSystem, items: [{ to: "/system", label: t.systemResources, icon: <HardDriveIcon /> }] }] : []),
+  ]
+
+  return (
+    <TooltipProvider>
+      <Toaster position="top-center" />
+      <AppLayout
+        logo={{ light: <FirmamentMark className="size-7 shrink-0" />, dark: <FirmamentMark className="size-7 shrink-0" /> }}
+        title={t.appName}
+        nav={nav}
+        pageTitle={pageTitle(location.pathname, t)}
+        headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button><LanguageMenu locale={locale} setLocale={setLocale} label={t.language} /><ThemeSwitcher label={t.appearance} light={t.themeLight} dark={t.themeDark} system={t.themeSystem} /></div>}
+      >
+        <Routes>
+          <Route path="/" element={<OverviewPage auth={auth} locale={locale} t={t} />} />
+          <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} />} />
+          <Route path="/sync" element={<SyncPage auth={auth} locale={locale} t={t} />} />
+          <Route path="/linkit" element={<LinkitPage auth={auth} t={t} />} />
+          <Route path="/system" element={me.data.is_root ? <SystemResourcesPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
+          <Route path="/setup" element={<SetupPage auth={auth} t={t} onDone={refresh} />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AppLayout>
+    </TooltipProvider>
+  )
+}
+
+function pageTitle(pathname: string, t: Copy) {
+  if (pathname.startsWith("/datasets")) return t.datasets
+  if (pathname.startsWith("/sync")) return t.sync
+  if (pathname === "/linkit") return t.linkit
+  if (pathname === "/system") return t.systemResources
+  return t.overview
+}
