@@ -2,7 +2,15 @@
 
 Firmament 是一个面向研究与交易场景的数据仓库：实时数据落在 SQLite WAL 热库，历史数据以 Parquet 归档到 S3 冷库。行情、新闻与事件被挂上同一片"数据天穹"，供生态内的产品读取、分发与导出。
 
+线上部署：**https://firma.ntnl.io**
+
 浏览器端提供目录授权同步：用户打开网页、选择一个本地目录，Web 用 File System Access API 把远端的部分数据同步到本地，并始终保持本地目录是 Firmament 的一个子集。
+
+## 数据从哪来
+
+Firmament 是一块**黑板**：数据由**外部进程写入**——脚本、Cybion 任务或生态内的其他产品把数据挂到对应数据集之下。采集（抓取、轮询、调度）发生在写入者一侧，Firmament 自身不做采集，只负责保管（热库 / 冷库）与分发（导出 / 同步）。写入者不需要知道读取者，一次写入全生态可读。
+
+面向外部写入者的写入接口（写 token + 文件上传）是路线上的下一步；当前版本内置演示数据集，可先体验完整的读取链路。
 
 ## 核心概念
 
@@ -14,21 +22,24 @@ Firmament 是一个面向研究与交易场景的数据仓库：实时数据落�
 ## 数据架构
 
 - **热库**：`~/.firmament/default.sqlite3`，启动时强制 `journal_mode=WAL`（允许读取在写入时继续进行）。
-- **冷库**：Parquet 对象存于 S3 专用桶，按数据集前缀归档；冷数据在导出与同步时按需获取。
+- **数据集目录**：`~/.firmament/datasets/`，清单（manifest）对目录内文件现场生成路径、大小、SHA-256 与更新时间；导出与同步共用这一份清单。
+- **冷库**：Parquet 对象将按数据集前缀存放于专用 S3 桶；归档作业（热 → 冷）与冷库查询管线尚未实装，结构已预留。
 
 ## 认证与 Linkit
 
 - 前端通过 [Auth Mini](https://auth.ntnl.io) 登录（audience 为 `firma.ntnl.io`，并同时申请 `linkit.ntnl.io` 以复用 Linkit 集成会话）。
 - 后端用 `auth-mini-axum` 校验 Auth Mini JWKS。第一个确认初始化的用户成为 `root_user_id`。
-- Linkit 通知为每位用户独立配置的 Bot 凭证（`sk-…` Token）：保存后可用于发送同步与导出通知；Token 以 AES-256-GCM 加密存储。
+- Linkit 通知为每位用户独立配置的 Bot 凭证（`sk-…` Token）：保存后可用于发送同步与导出通知；Token 以 AES-256-GCM 加密存储，密钥文件 `~/.firmament/credential.key` 权限 0600。
 
 ## 本地开发
 
 需要 Rust 1.93 与 Node.js 24：
 
 ```bash
-cd web && npm ci && npm run build
-cd .. && cargo test --all-targets --all-features
+cd web && npm ci && npm run build && cd ..
+cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
 cargo run
 ```
 
@@ -36,4 +47,6 @@ cargo run
 
 ## 发布
 
-`main` 分支的每次合并会触发 release：构建前端与 Linux 二进制（`firmament-x86_64-unknown-linux-gnu.tar.gz`），产出一个 GitHub Release，并通过 AWS SSM 部署到 `firmament-prod` 实例；部署脚本以 `https://firma.ntnl.io/api/health` 做健康检查。
+`main` 分支的每次合并会触发 release：构建前端与 Linux 二进制（`firmament-x86_64-unknown-linux-gnu.tar.gz`，tag 形如 `v0.1.0-<run_number>`），产出一个 GitHub Release，并通过 AWS SSM 部署到 `firmament-prod` 实例；部署脚本以 `https://firma.ntnl.io/api/health` 做健康检查。
+
+架构与设计决策见 [DESIGN.md](DESIGN.md)，产品定位见 [PRODUCT.md](PRODUCT.md)。
