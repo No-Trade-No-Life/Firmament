@@ -15,8 +15,8 @@ flowchart LR
 ```
 
 - **热库**：单实例 SQLite，强制 WAL 模式；启动即建表，`app_meta` 保存 root user 等应用配置。
-- **冷库**：Parquet 按数据集前缀存放于专用 S3 桶（实例通过 IAM instance profile 获得该桶读写权限）。
-- **清单**：`GET /api/v1/datasets/{id}/manifest` 现场扫描数据集目录，返回路径、大小、SHA-256 与更新时间。导出与同步共用。
+- **冷库**：Parquet 按数据集前缀存放于 S3 桶（`datasets/{id}/` 前缀，实例通过 IAM instance profile 获得桶读写权限）；由归档作业写入，详见「归档与冷库」。
+- **清单**：`GET /api/v1/datasets/{id}/manifest` 现场扫描热文件（数据集目录）与冷文件目录，返回路径、大小、SHA-256、更新时间与层级标记。导出与同步共用。
 - **同步器**：服务端只保存"数据集 + 子目录前缀"的配置记录；真正的文件搬运发生在浏览器。
 
 ## 同步协议
@@ -30,6 +30,13 @@ flowchart LR
 
 目录句柄通过 IndexedDB 保存，下次同步可复用（只需重新确认权限）。
 
+## 归档与冷库
+
+- **归档作业**：root 在数据集上触发（`POST /api/v1/datasets/{id}/archive`，同一数据集同时只允许一个作业）。作业把数据集目录中的表格文件转换为 Parquet（`*.csv` → `*.parquet`，`*.parquet` 直传），上传到 S3 冷库的 `datasets/{id}/` 前缀，校验对象大小与 SHA-256 后移除本地热副本；非表格文件跳过。作业进度记录在 `archive_jobs`。
+- **冷目录**：归档成功的对象登记于 `cold_files`；清单 = 本地扫描（热）+ 冷目录（冷），两层对导出与同步呈现相同路径。
+- **回源**：请求冷文件时，服务端按需从 S3 流式取回；浏览器下载完成后仍以 SHA-256 校验。
+- **配置**：桶与区域存于 `app_meta`（`cold_bucket`、`cold_region`），root 可通过 `GET/PUT /api/v1/cold` 调整。
+
 ## 安全
 
 - Auth Mini JWT 校验（audience `firma.ntnl.io`），后端不做登录页。
@@ -38,4 +45,4 @@ flowchart LR
 
 ## 未决
 
-- 冷库的写入管线（归档作业）与 Parquet 查询路径尚未实装，接口已按上面结构预留。
+- 冷库的清理与对账（purge、孤儿对象、绕过应用的 S3 直写）尚未实装；大文件仍是整体读入内存；数据集级 tier 与文件级冷热的语义尚未统一。
