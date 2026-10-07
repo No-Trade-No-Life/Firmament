@@ -1,0 +1,30 @@
+name: pr-check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate frontend
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Validate Rust
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
