@@ -7,15 +7,14 @@ import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, LayoutDash
 import { AppLayout, type AppNavGroup } from "@zccz14/ux"
 
 import { FirmamentMark } from "./components/firmament-mark"
-import { LanguageMenu } from "./components/language-menu"
-import { ThemeSwitcher } from "./components/theme-switcher"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { request, type AuthSdk } from "./lib/api"
-import { copy, initialLocale, localeStorageKey, negotiateLocale, type Copy, type Locale } from "./lib/i18n"
+import { applyFavicon } from "./lib/favicon"
+import { copy, initialLocale, negotiateLocale, persistLocale, type Copy, type Locale } from "./lib/i18n"
 import type { Me } from "./lib/types"
 import { DatasetsPage } from "./pages/datasets-page"
 import { LinkitPage } from "./pages/linkit-page"
@@ -27,18 +26,37 @@ import { SystemResourcesPage } from "./pages/system-resources-page"
 export default function App() {
   const { isReady, isAuthenticated, sdk } = useAuthMini()
   const [locale, setLocale] = useState<Locale>(initialLocale)
+  useEffect(() => {
+    persistLocale(locale)
+    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en"
+  }, [locale])
   const t = copy[locale]
   if (!isReady || !isAuthenticated || !sdk) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{t.signin}</div>
-  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><FirmamentShell auth={sdk} locale={locale} setLocale={setLocale} t={t} /></LinkitProvider>
+  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><FaviconSync /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
 }
 
-function FirmamentShell({ auth, locale, setLocale, t }: { auth: AuthSdk; locale: Locale; setLocale: (locale: Locale) => void; t: Copy }) {
+// The signed-in Linkit profile owns the language preference; follow it
+// instead of rendering a separate switcher in the application header.
+function LinkitLanguageSync({ setLocale }: { setLocale: (locale: Locale) => void }) {
   const { languages } = useLinkit()
   useEffect(() => {
-    if (window.localStorage.getItem(localeStorageKey) !== null) return
     const next = negotiateLocale(languages)
     if (next) setLocale(next)
   }, [languages, setLocale])
+  return null
+}
+
+// Keep the favicon in step with the resolved theme without a reload.
+function FaviconSync() {
+  const { resolvedTheme } = useLinkit()
+  useEffect(() => {
+    applyFavicon(resolvedTheme)
+  }, [resolvedTheme])
+  return null
+}
+
+function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t: Copy }) {
+  const { resolvedTheme } = useLinkit()
   const queryClient = useQueryClient()
   const location = useLocation()
   const me = useQuery({ queryKey: ["me"], queryFn: () => request<Me>("/api/v1/me", auth) })
@@ -63,13 +81,13 @@ function FirmamentShell({ auth, locale, setLocale, t }: { auth: AuthSdk; locale:
 
   return (
     <TooltipProvider>
-      <Toaster position="top-center" />
+      <Toaster position="top-center" theme={resolvedTheme} />
       <AppLayout
         logo={{ light: <FirmamentMark className="size-7 shrink-0" />, dark: <FirmamentMark className="size-7 shrink-0" /> }}
         title={t.appName}
         nav={nav}
         pageTitle={pageTitle(location.pathname, t)}
-        headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button><LanguageMenu locale={locale} setLocale={setLocale} label={t.language} /><ThemeSwitcher label={t.appearance} light={t.themeLight} dark={t.themeDark} system={t.themeSystem} /></div>}
+        headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button></div>}
       >
         <Routes>
           <Route path="/" element={<OverviewPage auth={auth} locale={locale} t={t} />} />
