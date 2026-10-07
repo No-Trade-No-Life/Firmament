@@ -7,9 +7,11 @@
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b1020" />
     <script>
+      // Linkit owns the dark mode preference (see linkit-react-components);
+      // apply the mirrored preference before the first paint.
       (function () {
         try {
-          var choice = window.localStorage.getItem('firmament.theme');
+          var choice = window.localStorage.getItem('linkit.theme');
           var dark = choice === 'dark' || (choice !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
           var root = document.documentElement;
           root.classList.toggle('dark', dark);
