@@ -11,6 +11,8 @@ export type Dataset = {
   tier: "hot" | "cold"
   file_count: number
   bytes: number
+  cold_file_count: number
+  cold_bytes: number
   updated_at: number
 }
 
@@ -19,6 +21,7 @@ export type DatasetManifestFile = {
   size: number
   sha256: string
   updated_at: number
+  tier: "hot" | "cold"
 }
 
 export type DatasetManifest = {
@@ -43,6 +46,24 @@ export type LinkitSettings = {
   configured: boolean
   updated_at: number
 } | null
+
+export type ArchiveJob = {
+  id: string
+  dataset_id: string
+  status: "running" | "completed" | "failed"
+  total_files: number
+  archived_files: number
+  skipped_files: number
+  failed_files: number
+  message: string
+  created_at: number
+  finished_at: number | null
+}
+
+export type ColdSettings = {
+  bucket: string
+  region: string
+}
 
 export type SystemResources = {
   sampled_at: number

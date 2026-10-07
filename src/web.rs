@@ -1,4 +1,4 @@
-use std::path::{Component, Path as FsPath, PathBuf};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use auth_mini_axum::{AuthMiniLayer, AuthMiniPrincipal};
@@ -14,18 +14,23 @@ use chrono::Utc;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::db::{Database, DatabaseError, LinkitSettings, Syncer};
+use crate::cold::{ColdStore, S3ColdStore, object_key};
+use crate::db::{
+    ArchiveJob, DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, LinkitSettings,
+    META_COLD_BUCKET, META_COLD_REGION, Syncer,
+};
+use crate::files::{normalize_relative_path, scan_directory, sha256_hex};
 use crate::resources::{ResourceMonitor, SystemResourcesSnapshot};
 
 #[derive(Clone)]
 struct AppState {
     database: Database,
     resources: Arc<Mutex<ResourceMonitor>>,
+    cold: Arc<dyn ColdStore>,
 }
 
 #[derive(RustEmbed)]
@@ -37,9 +42,11 @@ pub fn router(
     resources: Arc<Mutex<ResourceMonitor>>,
     auth: AuthMiniLayer,
 ) -> Router {
+    let cold: Arc<dyn ColdStore> = Arc::new(S3ColdStore::new(database.clone()));
     let state = AppState {
         database,
         resources,
+        cold,
     };
     let private = Router::new()
         .route("/me", get(me))
@@ -47,11 +54,16 @@ pub fn router(
         .route("/datasets", get(list_datasets))
         .route("/datasets/{id}/manifest", get(dataset_manifest))
         .route("/datasets/{id}/files/{*path}", get(dataset_file))
+        .route(
+            "/datasets/{id}/archive",
+            get(archive_status).post(start_archive),
+        )
         .route("/syncers", get(list_syncers).post(create_syncer))
         .route("/syncers/{id}", delete(remove_syncer))
         .route("/syncers/{id}/completed", post(mark_syncer_completed))
         .route("/linkit", get(get_linkit).put(put_linkit))
         .route("/linkit/test", post(test_linkit))
+        .route("/cold", get(get_cold_settings).put(put_cold_settings))
         .route("/system/resources", get(system_resources))
         .route_layer(auth);
     Router::new()
@@ -160,6 +172,8 @@ struct DatasetView {
     tier: String,
     file_count: usize,
     bytes: u64,
+    cold_file_count: usize,
+    cold_bytes: u64,
     updated_at: i64,
 }
 
@@ -167,20 +181,40 @@ async fn list_datasets(State(state): State<AppState>) -> Result<Json<Vec<Dataset
     let datasets = state.database.list_datasets()?;
     let mut views = Vec::with_capacity(datasets.len());
     for dataset in datasets {
-        let files = scan_directory(&state.database.dataset_directory(&dataset.id))?;
-        let bytes = files.iter().map(|file| file.size).sum();
-        let updated_at = files
+        let files = scan_directory(&state.database.dataset_directory(&dataset.id))
+            .map_err(|error| ApiError::files(&error))?;
+        let cold_files = state.database.list_cold_files(&dataset.id)?;
+        let mut paths = files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect::<HashSet<_>>();
+        let mut file_count = files.len();
+        let mut bytes: u64 = files.iter().map(|file| file.size).sum();
+        let mut updated_at = files
             .iter()
             .map(|file| file.updated_at)
             .max()
             .unwrap_or(dataset.created_at);
+        let mut cold_count = 0usize;
+        let mut cold_bytes: u64 = 0;
+        for cold in &cold_files {
+            cold_count += 1;
+            cold_bytes += cold.size;
+            if paths.insert(cold.path.as_str()) {
+                file_count += 1;
+                bytes += cold.size;
+            }
+            updated_at = updated_at.max(cold.archived_at);
+        }
         views.push(DatasetView {
             id: dataset.id,
             name: dataset.name,
             description: dataset.description,
             tier: dataset.tier,
-            file_count: files.len(),
+            file_count,
             bytes,
+            cold_file_count: cold_count,
+            cold_bytes,
             updated_at,
         });
     }
@@ -193,6 +227,7 @@ struct DatasetManifestFileView {
     size: u64,
     sha256: String,
     updated_at: i64,
+    tier: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +245,8 @@ async fn dataset_manifest(
         .database
         .dataset(&dataset_id)?
         .ok_or_else(ApiError::not_found)?;
-    let files = scan_directory(&state.database.dataset_directory(&dataset.id))?
+    let mut files = scan_directory(&state.database.dataset_directory(&dataset.id))
+        .map_err(|error| ApiError::files(&error))?
         .into_iter()
         .map(|file| -> Result<DatasetManifestFileView, ApiError> {
             let bytes = std::fs::read(&file.absolute).map_err(|error| ApiError::files(&error))?;
@@ -219,9 +255,27 @@ async fn dataset_manifest(
                 size: file.size,
                 sha256: sha256_hex(&bytes),
                 updated_at: file.updated_at,
+                tier: "hot",
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
+    let mut seen = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    for cold in state.database.list_cold_files(&dataset.id)? {
+        if !seen.insert(cold.path.clone()) {
+            continue;
+        }
+        files.push(DatasetManifestFileView {
+            path: cold.path,
+            size: cold.size,
+            sha256: cold.sha256,
+            updated_at: cold.archived_at,
+            tier: "cold",
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(Json(DatasetManifestView {
         dataset_id: dataset.id,
         generated_at: Utc::now().timestamp(),
@@ -246,12 +300,37 @@ async fn dataset_file(
     let bytes = match std::fs::read(&absolute) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::not_found());
+            return cold_file_response(&state, &dataset.id, &relative).await;
         }
         Err(error) => return Err(ApiError::files(&error)),
     };
     let mime = mime_guess::from_path(&absolute).first_or_octet_stream();
     Ok(([(header::CONTENT_TYPE, mime.as_ref())], Body::from(bytes)).into_response())
+}
+
+async fn cold_file_response(
+    state: &AppState,
+    dataset_id: &str,
+    relative: &std::path::Path,
+) -> Result<Response, ApiError> {
+    let path = relative.to_string_lossy().replace('\\', "/");
+    let key = object_key(dataset_id, &path);
+    let object = state
+        .cold
+        .get_object(&key)
+        .await
+        .map_err(|error| ApiError::internal(format!("cold storage fetch failed: {error}")))?
+        .ok_or_else(ApiError::not_found)?;
+    let mime = mime_guess::from_path(relative).first_or_octet_stream();
+    let stream = tokio_util::io::ReaderStream::new(object.body.into_async_read());
+    let mut response = Response::new(Body::from_stream(stream));
+    if let Ok(value) = header::HeaderValue::from_str(mime.as_ref()) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(&object.size.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,6 +477,97 @@ async fn test_linkit(
     Ok(Json(json!({"sent": true})))
 }
 
+#[derive(Debug, Serialize)]
+struct ColdSettingsView {
+    bucket: String,
+    region: String,
+}
+
+async fn get_cold_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+) -> Result<Json<ColdSettingsView>, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    Ok(Json(ColdSettingsView {
+        bucket: state
+            .database
+            .meta_value(META_COLD_BUCKET)?
+            .unwrap_or_else(|| DEFAULT_COLD_BUCKET.to_owned()),
+        region: state
+            .database
+            .meta_value(META_COLD_REGION)?
+            .unwrap_or_else(|| DEFAULT_COLD_REGION.to_owned()),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ColdSettingsInput {
+    bucket: String,
+    region: String,
+}
+
+async fn put_cold_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Json(input): Json<ColdSettingsInput>,
+) -> Result<Json<ColdSettingsView>, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    let bucket = input.bucket.trim().to_ascii_lowercase();
+    let region = input.region.trim().to_ascii_lowercase();
+    let bucket_ok = !bucket.is_empty()
+        && bucket.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '.'
+        });
+    let region_ok = !region.is_empty()
+        && region.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        });
+    if !bucket_ok || !region_ok {
+        return Err(ApiError::bad_request("invalid cold storage settings"));
+    }
+    state.database.put_meta_value(META_COLD_BUCKET, &bucket)?;
+    state.database.put_meta_value(META_COLD_REGION, &region)?;
+    Ok(Json(ColdSettingsView { bucket, region }))
+}
+
+async fn archive_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Path(dataset_id): Path<String>,
+) -> Result<Json<Option<ArchiveJob>>, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    if state.database.dataset(&dataset_id)?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(state.database.latest_archive_job(&dataset_id)?))
+}
+
+async fn start_archive(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Path(dataset_id): Path<String>,
+) -> Result<(StatusCode, Json<ArchiveJob>), ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    let dataset = state
+        .database
+        .dataset(&dataset_id)?
+        .ok_or_else(ApiError::not_found)?;
+    let Some(job) = state.database.create_archive_job_if_idle(&dataset.id)? else {
+        return Err(ApiError::conflict("an archive job is already running"));
+    };
+    let database = state.database.clone();
+    let cold = state.cold.clone();
+    let job_id = job.id.clone();
+    let dataset_id = dataset.id.clone();
+    tokio::spawn(async move {
+        crate::archive::run_archive_job(&database, cold.as_ref(), &dataset_id, &job_id).await;
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
 async fn system_resources(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
@@ -430,80 +600,6 @@ async fn static_asset(uri: axum::extract::OriginalUri) -> Response {
         .into_response()
 }
 
-struct ScannedFile {
-    relative: String,
-    absolute: PathBuf,
-    size: u64,
-    updated_at: i64,
-}
-
-fn scan_directory(root: &FsPath) -> Result<Vec<ScannedFile>, ApiError> {
-    let mut files = Vec::new();
-    collect_directory(root, root, &mut files)?;
-    files.sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(files)
-}
-
-fn collect_directory(
-    root: &FsPath,
-    directory: &FsPath,
-    files: &mut Vec<ScannedFile>,
-) -> Result<(), ApiError> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(ApiError::files(&error)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| ApiError::files(&error))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = entry.metadata().map_err(|error| ApiError::files(&error))?;
-        if metadata.is_dir() {
-            collect_directory(root, &path, files)?;
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let updated_at = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_secs() as i64);
-        files.push(ScannedFile {
-            relative,
-            absolute: path,
-            size: metadata.len(),
-            updated_at,
-        });
-    }
-    Ok(())
-}
-
-fn normalize_relative_path(path: &str) -> Option<PathBuf> {
-    let mut clean = PathBuf::new();
-    for component in FsPath::new(path).components() {
-        match component {
-            Component::Normal(part) => clean.push(part),
-            _ => return None,
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        return None;
-    }
-    Some(clean)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -529,6 +625,13 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: "resource not found".to_owned(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
         }
     }
 

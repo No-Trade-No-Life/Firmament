@@ -91,7 +91,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
       >
         <Routes>
           <Route path="/" element={<OverviewPage auth={auth} locale={locale} t={t} />} />
-          <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} />} />
+          <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} isRoot={me.data.is_root} />} />
           <Route path="/sync" element={<SyncPage auth={auth} locale={locale} t={t} />} />
           <Route path="/linkit" element={<LinkitPage auth={auth} t={t} />} />
           <Route path="/system" element={me.data.is_root ? <SystemResourcesPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
