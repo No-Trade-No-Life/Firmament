@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod archive;
+mod cold;
 mod crypto;
 mod db;
+mod files;
 mod resources;
 mod web;
 
