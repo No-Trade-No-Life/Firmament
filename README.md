@@ -47,7 +47,7 @@ cargo run
 
 ## Logo
 
-圆穹顶 Logo 与 [NTNL 首页](https://www.ntnl.io/marks/firma.svg) 使用同一套 SVG 几何：半圆天穹、椭圆底环与内部经线，32 × 32 viewBox、1.8 单位圆角描边。应用内组件、静态 favicon 和随主题切换的动态 favicon 同步更新；保留现有浅色黑线、深色白线的主题行为。`web/tests/branding.test.mjs` 校验三处图形及两种主题的 favicon，防止只更新一处而产生不一致。
+圆穹顶 Logo 与 [NTNL 首页](https://www.ntnl.io/marks/firma.svg) 使用同一套 SVG 几何：半圆天穹、椭圆底环与内部经线，32 × 32 viewBox、1.8 单位圆角描边。应用内组件、静态 favicon 和随主题切换的动态 favicon 同步更新；保留现有浅色黑线、深色白线的主题行为。`web/tests/branding.test.mjs` 校验三处图形及两种主题的 favicon，防止只更新一处而产生不一致。静态 favicon URL 带版本号，避免 CDN 和浏览器在未登录时沿用旧图形；以后调整几何时同步更新 `web/index.html` 中的版本号。
 
 ## 发行与部署
 
