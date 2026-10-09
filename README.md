@@ -36,7 +36,7 @@ Firmament 是一块**黑板**：数据由**外部进程发布**——脚本、Cy
 需要 Rust 1.93 与 Node.js 24：
 
 ```bash
-cd web && npm ci && npm run build && cd ..
+cd web && npm ci && npm run lint && npm test && npm run build && cd ..
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
@@ -44,6 +44,10 @@ cargo run
 ```
 
 服务监听 `127.0.0.1:8080`。SQLite 位于 `~/.firmament/default.sqlite3`。
+
+## Logo
+
+圆穹顶 Logo 与 [NTNL 首页](https://www.ntnl.io/marks/firma.svg) 使用同一套 SVG 几何：半圆天穹、椭圆底环与内部经线，32 × 32 viewBox、1.8 单位圆角描边。应用内组件、静态 favicon 和随主题切换的动态 favicon 同步更新；保留现有浅色黑线、深色白线的主题行为。`web/tests/branding.test.mjs` 校验三处图形及两种主题的 favicon，防止只更新一处而产生不一致。
 
 ## 发行与部署
 
