@@ -46,6 +46,11 @@ test("static favicon uses the same dome with light and dark system colors", () =
   assert.match(svg, /stroke: #fff/)
 })
 
+test("initial document versions the favicon URL to avoid the previous CDN cache", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8")
+  assert.match(html, /rel="icon"[^>]*href="\/firmament-mark\.svg\?v=dome-v1"/)
+})
+
 test("theme changes regenerate the dome favicon in both directions", (t) => {
   const originalDocument = globalThis.document
   const link = { href: "/firmament-mark.svg" }
