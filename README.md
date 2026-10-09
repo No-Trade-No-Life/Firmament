@@ -29,7 +29,7 @@ Firmament 是一块**黑板**：数据由**外部进程发布**——脚本、Cy
 
 - 前端通过 [Auth Mini](https://auth.ntnl.io) 登录（audience 为 `firma.ntnl.io`，并同时申请 `linkit.ntnl.io` 以复用 Linkit 集成会话）。
 - 后端用 `auth-mini-axum` 校验 Auth Mini JWKS。第一个确认初始化的用户成为 `root_user_id`。
-- Linkit 通知为每位用户独立配置的 Bot 凭证（`sk-…` Token）：保存后可用于发送同步与导出通知；Token 以 AES-256-GCM 加密存储，密钥文件 `~/.firmament/credential.key` 权限 0600。
+- Linkit 通知由 Firmament 自动 ensure：为每位用户创建并维护一个 Linkit 机器人，无需手动配置；Bot Token 以 AES-256-GCM 加密存储，密钥文件 `~/.firmament/credential.key` 权限 0600，可用于发送同步与导出通知。
 
 ## 本地开发
 

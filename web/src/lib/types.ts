@@ -40,12 +40,14 @@ export type Syncer = {
   last_synced_at: number | null
 }
 
-export type LinkitSettings = {
-  owner_id: string
-  recipient_username: string
+export type LinkitStatus = {
   configured: boolean
-  updated_at: number
-} | null
+  bot_id: string | null
+  recipient_username: string | null
+  last_attempt_at: number | null
+  last_success_at: number | null
+  last_error: string | null
+}
 
 export type ArchiveJob = {
   id: string

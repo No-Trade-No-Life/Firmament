@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Extension, Path, State},
-    http::{Method, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -20,10 +20,11 @@ use tower_http::trace::TraceLayer;
 
 use crate::cold::{ColdStore, S3ColdStore, object_key};
 use crate::db::{
-    ArchiveJob, DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, LinkitSettings,
+    ArchiveJob, DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, LinkitStatus,
     META_COLD_BUCKET, META_COLD_REGION, Syncer,
 };
 use crate::files::{normalize_relative_path, scan_directory, sha256_hex};
+use crate::linkit::{self, LinkitError};
 use crate::resources::{ResourceMonitor, SystemResourcesSnapshot};
 
 #[derive(Clone)]
@@ -61,7 +62,7 @@ pub fn router(
         .route("/syncers", get(list_syncers).post(create_syncer))
         .route("/syncers/{id}", delete(remove_syncer))
         .route("/syncers/{id}/completed", post(mark_syncer_completed))
-        .route("/linkit", get(get_linkit).put(put_linkit))
+        .route("/linkit", get(get_linkit).post(ensure_linkit))
         .route("/linkit/test", post(test_linkit))
         .route("/cold", get(get_cold_settings).put(put_cold_settings))
         .route("/system/resources", get(system_resources))
@@ -420,60 +421,38 @@ async fn mark_syncer_completed(
 async fn get_linkit(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-) -> Result<Json<Option<LinkitSettings>>, ApiError> {
-    Ok(Json(state.database.linkit_settings(&principal.subject)?))
+) -> Result<Json<LinkitStatus>, ApiError> {
+    Ok(Json(linkit::status(&state.database, &principal.subject)?))
 }
 
-#[derive(Debug, Deserialize)]
-struct LinkitInput {
-    recipient_username: String,
-    bot_token: String,
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
-async fn put_linkit(
+// INVARIANT: the auth middleware verified this same `Authorization` header, so
+// this bearer belongs to the authenticated user; Linkit authorizes it as that
+// user when the Bot is provisioned on their account.
+async fn ensure_linkit(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-    Json(input): Json<LinkitInput>,
-) -> Result<Json<LinkitSettings>, ApiError> {
-    let recipient_username = input.recipient_username.trim();
-    let bot_token = input.bot_token.trim();
-    if recipient_username.is_empty() || bot_token.is_empty() {
-        return Err(ApiError::bad_request(
-            "recipient_username and a Linkit sk- token are required",
-        ));
-    }
-    Ok(Json(state.database.put_linkit_settings(
-        &principal.subject,
-        recipient_username,
-        bot_token,
-    )?))
+    headers: HeaderMap,
+) -> Result<Json<LinkitStatus>, ApiError> {
+    let bearer =
+        bearer_token(&headers).ok_or_else(|| ApiError::bad_request("Bearer token is required"))?;
+    Ok(Json(
+        linkit::ensure(&state.database, linkit::API_URL, &principal.subject, bearer).await?,
+    ))
 }
 
 async fn test_linkit(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
 ) -> Result<Json<Value>, ApiError> {
-    let settings = state
-        .database
-        .secret_linkit_settings(&principal.subject)?
-        .ok_or_else(|| ApiError::bad_request("Linkit notifications are not configured"))?;
-    let response = reqwest::Client::new()
-        .post("https://linkit.ntnl.io/bot/v1/messages")
-        .bearer_auth(&settings.bot_token)
-        .json(&json!({
-            "recipient_username": settings.recipient_username,
-            "body": "Firmament 测试消息：通知通道正常。",
-        }))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("Linkit request failed: {error}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(ApiError::internal(format!(
-            "Linkit responded {status}: {body}"
-        )));
-    }
+    linkit::send_test(&state.database, linkit::API_URL, &principal.subject).await?;
     Ok(Json(json!({"sent": true})))
 }
 
@@ -648,11 +627,32 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<DatabaseError> for ApiError {
     fn from(error: DatabaseError) -> Self {
         Self::internal(format!("state storage failed: {error}"))
+    }
+}
+
+impl From<LinkitError> for ApiError {
+    fn from(error: LinkitError) -> Self {
+        match error {
+            LinkitError::Database(error) => Self::from(error),
+            LinkitError::Conflict(message) => Self::conflict(message),
+            LinkitError::Forbidden(message) => Self::forbidden(message),
+            LinkitError::Unavailable(message) => Self::unavailable(message),
+            LinkitError::Request(error) => {
+                Self::unavailable(format!("Linkit request failed: {error}"))
+            }
+        }
     }
 }
 
