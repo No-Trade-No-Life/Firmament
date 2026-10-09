@@ -19,7 +19,7 @@
     "auth-mini-react-components": "^0.6.10",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.2.5",
-    "linkit-react-components": "^0.6.0",
+    "linkit-react-components": "^0.6.2",
     "lucide-react": "^1.41.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
