@@ -15,7 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { request, type AuthSdk } from "./lib/api"
 import { applyFavicon } from "./lib/favicon"
 import { copy, initialLocale, negotiateLocale, persistLocale, type Copy, type Locale } from "./lib/i18n"
-import type { Me } from "./lib/types"
+import type { LinkitStatus, Me } from "./lib/types"
 import { DatasetsPage } from "./pages/datasets-page"
 import { LinkitPage } from "./pages/linkit-page"
 import { OverviewPage } from "./pages/overview-page"
@@ -32,7 +32,7 @@ export default function App() {
   }, [locale])
   const t = copy[locale]
   if (!isReady || !isAuthenticated || !sdk) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{t.signin}</div>
-  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><FaviconSync /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
+  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><FaviconSync /><LinkitAutoEnsure auth={sdk} /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
 }
 
 // The signed-in Linkit profile owns the language preference; follow it
@@ -52,6 +52,24 @@ function FaviconSync() {
   useEffect(() => {
     applyFavicon(resolvedTheme)
   }, [resolvedTheme])
+  return null
+}
+
+// Firmament keeps one Linkit Bot per user; this silent call provisions or
+// repairs the connection on every workspace load, so notifications never need
+// a setup step.
+function LinkitAutoEnsure({ auth }: { auth: AuthSdk }) {
+  const client = useQueryClient()
+  const ensure = useQuery({
+    queryKey: ["linkit-ensure", auth.session.getState().sessionId],
+    queryFn: () => request<LinkitStatus>("/api/v1/linkit", auth, { method: "POST" }),
+    retry: false,
+    staleTime: Infinity,
+  })
+  useEffect(() => {
+    if (!ensure.isSuccess) return
+    void client.invalidateQueries({ queryKey: ["linkit"] })
+  }, [client, ensure.isSuccess])
   return null
 }
 
@@ -93,7 +111,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
           <Route path="/" element={<OverviewPage auth={auth} locale={locale} t={t} />} />
           <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} isRoot={me.data.is_root} />} />
           <Route path="/sync" element={<SyncPage auth={auth} locale={locale} t={t} />} />
-          <Route path="/linkit" element={<LinkitPage auth={auth} t={t} />} />
+          <Route path="/linkit" element={<LinkitPage auth={auth} locale={locale} t={t} />} />
           <Route path="/system" element={me.data.is_root ? <SystemResourcesPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
           <Route path="/setup" element={<SetupPage auth={auth} t={t} onDone={refresh} />} />
           <Route path="*" element={<Navigate to="/" replace />} />

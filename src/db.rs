@@ -55,18 +55,21 @@ pub struct Syncer {
     pub last_synced_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LinkitSettings {
-    pub owner_id: String,
-    pub recipient_username: String,
+#[derive(Clone, Debug, Serialize)]
+pub struct LinkitStatus {
     pub configured: bool,
-    pub updated_at: i64,
+    pub bot_id: Option<String>,
+    pub recipient_username: Option<String>,
+    pub last_attempt_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SecretLinkitSettings {
-    pub recipient_username: String,
+    pub bot_id: String,
     pub bot_token: String,
+    pub username: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -122,6 +125,7 @@ impl Database {
         let database_path = state_directory.join("default.sqlite3");
         let datasets_directory = state_directory.join("datasets");
         let connection = Connection::open(&database_path)?;
+        drop_legacy_linkit_settings(&connection)?;
         connection.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -150,8 +154,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS syncers_owner_id_idx ON syncers(owner_id);
             CREATE TABLE IF NOT EXISTS linkit_settings (
                 owner_id TEXT PRIMARY KEY NOT NULL,
-                recipient_username TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
                 bot_token_ciphertext TEXT NOT NULL,
+                username TEXT NOT NULL,
+                last_attempt_at INTEGER,
+                last_success_at INTEGER,
+                last_error TEXT,
                 updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS cold_files (
@@ -327,63 +335,92 @@ impl Database {
         self.get_syncer(id)
     }
 
-    pub fn put_linkit_settings(
-        &self,
-        owner_id: &str,
-        recipient_username: &str,
-        bot_token: &str,
-    ) -> Result<LinkitSettings, DatabaseError> {
-        let updated_at = Utc::now().timestamp();
-        let ciphertext = self.cipher.encrypt(bot_token)?;
-        self.connection()?.execute(
-            "INSERT INTO linkit_settings(owner_id, recipient_username, bot_token_ciphertext, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(owner_id) DO UPDATE SET recipient_username = excluded.recipient_username, bot_token_ciphertext = excluded.bot_token_ciphertext, updated_at = excluded.updated_at",
-            params![owner_id, recipient_username, ciphertext, updated_at],
-        )?;
-        Ok(LinkitSettings {
-            owner_id: owner_id.to_owned(),
-            recipient_username: recipient_username.to_owned(),
-            configured: true,
-            updated_at,
-        })
-    }
-
-    pub fn linkit_settings(&self, owner_id: &str) -> Result<Option<LinkitSettings>, DatabaseError> {
+    pub fn linkit_status(&self, owner_id: &str) -> Result<LinkitStatus, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT owner_id, recipient_username, updated_at FROM linkit_settings WHERE owner_id = ?1",
+                "SELECT bot_id, username, last_attempt_at, last_success_at, last_error FROM linkit_settings WHERE owner_id = ?1",
                 [owner_id],
                 |row| {
-                    Ok(LinkitSettings {
-                        owner_id: row.get(0)?,
-                        recipient_username: row.get(1)?,
+                    Ok(LinkitStatus {
                         configured: true,
-                        updated_at: row.get(2)?,
+                        bot_id: Some(row.get(0)?),
+                        recipient_username: Some(row.get(1)?),
+                        last_attempt_at: row.get(2)?,
+                        last_success_at: row.get(3)?,
+                        last_error: row.get(4)?,
                     })
                 },
             )
             .optional()
+            .map(|stored| {
+                stored.unwrap_or(LinkitStatus {
+                    configured: false,
+                    bot_id: None,
+                    recipient_username: None,
+                    last_attempt_at: None,
+                    last_success_at: None,
+                    last_error: None,
+                })
+            })
             .map_err(DatabaseError::Sqlite)
     }
 
-    pub fn secret_linkit_settings(
+    pub fn linkit_connection(
         &self,
         owner_id: &str,
     ) -> Result<Option<SecretLinkitSettings>, DatabaseError> {
         let row = self
             .connection()?
             .query_row(
-                "SELECT recipient_username, bot_token_ciphertext FROM linkit_settings WHERE owner_id = ?1",
+                "SELECT bot_id, bot_token_ciphertext, username FROM linkit_settings WHERE owner_id = ?1",
                 [owner_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        row.map(|(recipient_username, ciphertext)| {
+        row.map(|(bot_id, ciphertext, username)| {
             Ok(SecretLinkitSettings {
-                recipient_username,
+                bot_id,
                 bot_token: self.cipher.decrypt(&ciphertext)?,
+                username,
             })
         })
         .transpose()
+    }
+
+    /// Stores the provisioned Bot and refreshes the stored username, keeping
+    /// the delivery status untouched.
+    pub fn save_linkit_bot(
+        &self,
+        owner_id: &str,
+        bot_id: &str,
+        bot_token: &str,
+        username: &str,
+    ) -> Result<(), DatabaseError> {
+        let updated_at = Utc::now().timestamp();
+        let ciphertext = self.cipher.encrypt(bot_token)?;
+        self.connection()?.execute(
+            "INSERT INTO linkit_settings(owner_id, bot_id, bot_token_ciphertext, username, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(owner_id) DO UPDATE SET bot_id = excluded.bot_id, bot_token_ciphertext = excluded.bot_token_ciphertext, username = excluded.username, updated_at = excluded.updated_at",
+            params![owner_id, bot_id, ciphertext, username, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_linkit_delivery(
+        &self,
+        owner_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "UPDATE linkit_settings SET last_attempt_at = ?2, last_error = ?3, last_success_at = CASE WHEN ?3 IS NULL THEN ?2 ELSE last_success_at END WHERE owner_id = ?1",
+            params![owner_id, Utc::now().timestamp(), error],
+        )?;
+        Ok(())
     }
 
     pub fn meta_value(&self, key: &str) -> Result<Option<String>, DatabaseError> {
@@ -587,6 +624,21 @@ fn write_if_missing(path: &Path, contents: &str) -> Result<(), DatabaseError> {
     std::fs::write(path, contents).map_err(DatabaseError::Files)
 }
 
+// The pre-ensure table stored a manually configured Bot. The connection is now
+// provisioned automatically and is rebuilt by the next `ensure` call, so the
+// legacy table is dropped instead of migrated.
+fn drop_legacy_linkit_settings(connection: &Connection) -> rusqlite::Result<()> {
+    let legacy = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('linkit_settings') WHERE name = 'recipient_username')",
+        [],
+        |row| row.get::<_, i64>(0).map(|exists| exists != 0),
+    )?;
+    if legacy {
+        connection.execute_batch("DROP TABLE linkit_settings;")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -709,5 +761,37 @@ mod tests {
         assert_eq!(latest.status, "completed");
         assert_eq!(latest.archived_files, 1);
         assert!(latest.finished_at.is_some());
+    }
+
+    #[test]
+    fn opening_a_database_with_the_legacy_linkit_table_rebuilds_it() {
+        let state = TempDir::new().expect("state directory");
+        {
+            let database = Database::open(state.path()).expect("database opens");
+            database
+                .connection()
+                .expect("connection")
+                .execute_batch(
+                    "DROP TABLE linkit_settings;
+                     CREATE TABLE linkit_settings (
+                         owner_id TEXT PRIMARY KEY NOT NULL,
+                         recipient_username TEXT NOT NULL,
+                         bot_token_ciphertext TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO linkit_settings(owner_id, recipient_username, bot_token_ciphertext, updated_at)
+                     VALUES ('owner', 'alice', 'legacy-ciphertext', 0);",
+                )
+                .expect("legacy table");
+        }
+
+        let database = Database::open(state.path()).expect("database reopens");
+        database
+            .save_linkit_bot("owner", "bot-1", "sk-token", "alice")
+            .expect("connection saves");
+        let status = database.linkit_status("owner").expect("status");
+        assert!(status.configured);
+        assert_eq!(status.bot_id.as_deref(), Some("bot-1"));
+        assert_eq!(status.recipient_username.as_deref(), Some("alice"));
     }
 }

@@ -5,6 +5,7 @@ mod cold;
 mod crypto;
 mod db;
 mod files;
+mod linkit;
 mod resources;
 mod web;
 
