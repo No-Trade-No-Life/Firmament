@@ -30,6 +30,13 @@ flowchart LR
 
 目录句柄通过 IndexedDB 保存，下次同步可复用（只需重新确认权限）。
 
+## 发布与写入治理
+
+- **数据集**：root 通过 `POST /api/v1/datasets` 创建（ID 为 slug，落库即生效；目录按需创建）。
+- **写 token**：root 通过 `POST /api/v1/write-tokens` 创建，明文只在响应中出现一次，库中仅存 SHA-256 哈希；`last_used_at` 随发布更新，`DELETE` 立即吊销。
+- **发布**：`PUT /api/v1/publish/{dataset_id}/{path}` 以写 token（Bearer）鉴权，与 Auth Mini 会话层分离；请求体即文件字节（上限 32 MiB）。路径只允许普通组件且不允许隐藏段；写入先落隐藏临时文件再 rename，保证原子替换。
+- **审计**：`publish_events` 记录发布者（token 名称冗余存储，吊销后仍可追溯）、数据集、路径、大小与 SHA-256；root 通过 `GET /api/v1/publish-events` 查看最近记录。
+
 ## 归档与冷库
 
 - **归档作业**：root 在数据集上触发（`POST /api/v1/datasets/{id}/archive`，同一数据集同时只允许一个作业）。作业把数据集目录中的表格文件转换为 Parquet（`*.csv` → `*.parquet`，`*.parquet` 直传），上传到 S3 冷库的 `datasets/{id}/` 前缀，校验对象大小与 SHA-256 后移除本地热副本；非表格文件跳过。作业进度记录在 `archive_jobs`。
@@ -46,3 +53,4 @@ flowchart LR
 ## 未决
 
 - 冷库的清理与对账（purge、孤儿对象、绕过应用的 S3 直写）尚未实装；大文件仍是整体读入内存；数据集级 tier 与文件级冷热的语义尚未统一。
+- 写 token 尚未按数据集限定范围；发布审计尚无保留与轮转策略。
