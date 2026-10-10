@@ -104,6 +104,34 @@ pub struct ArchiveCounts {
     pub failed_files: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WriteToken {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WriteTokenCreated {
+    pub id: String,
+    pub name: String,
+    pub secret: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishEvent {
+    pub id: String,
+    pub dataset_id: String,
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub token_id: String,
+    pub token_name: String,
+    pub created_at: i64,
+}
+
 const DEMO_DATASET: &str = "demo";
 const DEMO_DESCRIPTION: &str = "示例数据集：一段合成的行情样本，用来体验导出与同步流程。";
 const DEMO_README: &str = include_str!("../samples/demo/README.md");
@@ -184,6 +212,24 @@ impl Database {
                 finished_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS archive_jobs_dataset_id_idx ON archive_jobs(dataset_id);
+            CREATE TABLE IF NOT EXISTS write_tokens (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS publish_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                dataset_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                token_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS publish_events_created_at_idx ON publish_events(created_at);
             ",
         )?;
         let database = Self {
@@ -245,6 +291,20 @@ impl Database {
             .query_map([], dataset_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Creates a dataset id; returns `false` when the id already exists.
+    pub fn create_dataset(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<bool, DatabaseError> {
+        let changed = self.connection()?.execute(
+            "INSERT INTO datasets(id, name, description, tier, created_at) VALUES (?1, ?2, ?3, 'hot', ?4) ON CONFLICT(id) DO NOTHING",
+            params![id, name, description, Utc::now().timestamp()],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, DatabaseError> {
@@ -564,6 +624,93 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    pub fn create_write_token(
+        &self,
+        name: &str,
+        secret_hash: &str,
+    ) -> Result<WriteToken, DatabaseError> {
+        let token = WriteToken {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            created_at: Utc::now().timestamp(),
+            last_used_at: None,
+        };
+        self.connection()?.execute(
+            "INSERT INTO write_tokens(id, name, secret_hash, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![token.id, token.name, secret_hash, token.created_at],
+        )?;
+        Ok(token)
+    }
+
+    pub fn list_write_tokens(&self) -> Result<Vec<WriteToken>, DatabaseError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, created_at, last_used_at FROM write_tokens ORDER BY created_at DESC, rowid DESC",
+        )?;
+        statement
+            .query_map([], write_token_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    pub fn write_token_by_secret_hash(
+        &self,
+        secret_hash: &str,
+    ) -> Result<Option<WriteToken>, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT id, name, created_at, last_used_at FROM write_tokens WHERE secret_hash = ?1",
+                [secret_hash],
+                write_token_from_row,
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    pub fn touch_write_token(&self, id: &str, timestamp: i64) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "UPDATE write_tokens SET last_used_at = ?2 WHERE id = ?1",
+            params![id, timestamp],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_write_token(&self, id: &str) -> Result<bool, DatabaseError> {
+        let changed = self
+            .connection()?
+            .execute("DELETE FROM write_tokens WHERE id = ?1", [id])?;
+        Ok(changed == 1)
+    }
+
+    /// Records one publish in the audit trail; the token name is denormalized so
+    /// revoked tokens keep their attribution.
+    pub fn record_publish_event(
+        &self,
+        dataset_id: &str,
+        path: &str,
+        size: u64,
+        sha256: &str,
+        token_id: &str,
+        token_name: &str,
+    ) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "INSERT INTO publish_events(id, dataset_id, path, size, sha256, token_id, token_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![Uuid::new_v4().to_string(), dataset_id, path, size as i64, sha256, token_id, token_name, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_publish_events(&self, limit: i64) -> Result<Vec<PublishEvent>, DatabaseError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, dataset_id, path, size, sha256, token_id, token_name, created_at FROM publish_events ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], publish_event_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, DatabaseError> {
         self.connection.lock().map_err(|_| DatabaseError::Poisoned)
     }
@@ -588,6 +735,28 @@ fn syncer_from_row(row: &Row<'_>) -> rusqlite::Result<Syncer> {
         subdir: row.get(4)?,
         created_at: row.get(5)?,
         last_synced_at: row.get(6)?,
+    })
+}
+
+fn write_token_from_row(row: &Row<'_>) -> rusqlite::Result<WriteToken> {
+    Ok(WriteToken {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        last_used_at: row.get(3)?,
+    })
+}
+
+fn publish_event_from_row(row: &Row<'_>) -> rusqlite::Result<PublishEvent> {
+    Ok(PublishEvent {
+        id: row.get(0)?,
+        dataset_id: row.get(1)?,
+        path: row.get(2)?,
+        size: row.get::<_, i64>(3)?.max(0) as u64,
+        sha256: row.get(4)?,
+        token_id: row.get(5)?,
+        token_name: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -688,6 +857,81 @@ mod tests {
             .expect("syncer exists");
         assert_eq!(marked.last_synced_at, Some(42));
         assert!(database.delete_syncer(&syncer.id).expect("delete"));
+    }
+
+    #[test]
+    fn datasets_writes_and_publish_audit_round_trip() {
+        let state = TempDir::new().expect("state directory");
+        let database = Database::open(state.path()).expect("database opens");
+
+        assert!(
+            database
+                .create_dataset("okx-btc-swap", "OKX BTC 合约", "测试数据集")
+                .expect("dataset creates")
+        );
+        assert!(
+            !database
+                .create_dataset("okx-btc-swap", "OKX BTC 合约", "重复")
+                .expect("duplicate checks")
+        );
+        assert_eq!(
+            database
+                .dataset("okx-btc-swap")
+                .expect("dataset reads")
+                .expect("exists")
+                .tier,
+            "hot"
+        );
+
+        let token = database
+            .create_write_token("okx-publisher", "hash-1")
+            .expect("token creates");
+        assert!(token.last_used_at.is_none());
+        let found = database
+            .write_token_by_secret_hash("hash-1")
+            .expect("token lookup")
+            .expect("token exists");
+        assert_eq!(found.id, token.id);
+        assert!(
+            database
+                .write_token_by_secret_hash("hash-2")
+                .expect("miss lookup")
+                .is_none()
+        );
+
+        database
+            .record_publish_event(
+                "okx-btc-swap",
+                "klines-1m/2026-09-03.csv",
+                120,
+                "abc",
+                &token.id,
+                &token.name,
+            )
+            .expect("publish records");
+        database
+            .touch_write_token(&token.id, 42)
+            .expect("token touches");
+        let listed = database.list_write_tokens().expect("tokens list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].last_used_at, Some(42));
+        let events = database.list_publish_events(10).expect("events list");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "klines-1m/2026-09-03.csv");
+        assert_eq!(events[0].size, 120);
+        assert_eq!(events[0].token_name, "okx-publisher");
+
+        assert!(
+            database
+                .delete_write_token(&token.id)
+                .expect("token deletes")
+        );
+        assert!(
+            !database
+                .delete_write_token(&token.id)
+                .expect("repeat delete")
+        );
+        assert!(database.list_write_tokens().expect("list").is_empty());
     }
 
     #[test]

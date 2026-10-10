@@ -7,6 +7,15 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
 
+use crate::files::hex;
+
+/// Generates a fresh write token secret; only its SHA-256 hash is stored.
+pub fn write_token_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("firmament_{}", hex(&bytes))
+}
+
 #[derive(Clone, Debug)]
 pub struct Cipher {
     key: [u8; 32],
