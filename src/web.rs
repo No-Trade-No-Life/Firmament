@@ -4,11 +4,11 @@ use std::sync::Arc;
 use auth_mini_axum::{AuthMiniLayer, AuthMiniPrincipal};
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Extension, Path, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Extension, Path, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use chrono::Utc;
 use rust_embed::RustEmbed;
@@ -19,11 +19,16 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::cold::{ColdStore, S3ColdStore, object_key};
+use crate::crypto::write_token_secret;
 use crate::db::{
-    ArchiveJob, DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, LinkitStatus,
-    META_COLD_BUCKET, META_COLD_REGION, Syncer,
+    ArchiveJob, DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, Dataset,
+    LinkitStatus, META_COLD_BUCKET, META_COLD_REGION, PublishEvent, Syncer, WriteToken,
+    WriteTokenCreated,
 };
-use crate::files::{normalize_relative_path, scan_directory, sha256_hex};
+use crate::files::{
+    normalize_publish_path, normalize_relative_path, scan_directory, sha256_hex,
+    write_file_atomically,
+};
 use crate::linkit::{self, LinkitError};
 use crate::resources::{ResourceMonitor, SystemResourcesSnapshot};
 
@@ -37,6 +42,10 @@ struct AppState {
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
 struct WebAssets;
+
+// One publish carries a single table file; 32 MiB covers a full month of
+// one-minute candles with room to spare.
+const PUBLISH_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 pub fn router(
     database: Database,
@@ -52,7 +61,7 @@ pub fn router(
     let private = Router::new()
         .route("/me", get(me))
         .route("/setup", post(setup_root))
-        .route("/datasets", get(list_datasets))
+        .route("/datasets", get(list_datasets).post(create_dataset))
         .route("/datasets/{id}/manifest", get(dataset_manifest))
         .route("/datasets/{id}/files/{*path}", get(dataset_file))
         .route(
@@ -62,13 +71,25 @@ pub fn router(
         .route("/syncers", get(list_syncers).post(create_syncer))
         .route("/syncers/{id}", delete(remove_syncer))
         .route("/syncers/{id}/completed", post(mark_syncer_completed))
+        .route(
+            "/write-tokens",
+            get(list_write_tokens).post(create_write_token),
+        )
+        .route("/write-tokens/{id}", delete(remove_write_token))
+        .route("/publish-events", get(list_publish_events))
         .route("/linkit", get(get_linkit).post(ensure_linkit))
         .route("/linkit/test", post(test_linkit))
         .route("/cold", get(get_cold_settings).put(put_cold_settings))
         .route("/system/resources", get(system_resources))
         .route_layer(auth);
+    // Publishers authenticate with write tokens instead of an Auth Mini
+    // session, so the publish route lives outside the session layer.
+    let publish = Router::new()
+        .route("/{dataset_id}/{*path}", put(publish_file))
+        .route_layer(DefaultBodyLimit::max(PUBLISH_BODY_LIMIT));
     Router::new()
         .route("/api/health", get(health))
+        .nest("/api/v1/publish", publish)
         .nest("/api/v1", private)
         .fallback(static_asset)
         .with_state(state)
@@ -220,6 +241,49 @@ async fn list_datasets(State(state): State<AppState>) -> Result<Json<Vec<Dataset
         });
     }
     Ok(Json(views))
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetInput {
+    id: String,
+    name: String,
+    description: Option<String>,
+}
+
+fn valid_dataset_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && id.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+async fn create_dataset(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Json(input): Json<DatasetInput>,
+) -> Result<(StatusCode, Json<Dataset>), ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    let id = input.id.trim().to_ascii_lowercase();
+    let name = input.name.trim();
+    let description = input.description.unwrap_or_default().trim().to_owned();
+    if !valid_dataset_id(&id) {
+        return Err(ApiError::bad_request("invalid dataset id"));
+    }
+    if name.is_empty() {
+        return Err(ApiError::bad_request("dataset name is required"));
+    }
+    if !state.database.create_dataset(&id, name, &description)? {
+        return Err(ApiError::conflict("dataset already exists"));
+    }
+    let dataset = state
+        .database
+        .dataset(&id)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok((StatusCode::CREATED, Json(dataset)))
 }
 
 #[derive(Debug, Serialize)]
@@ -418,6 +482,113 @@ async fn mark_syncer_completed(
     Ok(Json(updated))
 }
 
+#[derive(Debug, Deserialize)]
+struct WriteTokenInput {
+    name: String,
+}
+
+async fn list_write_tokens(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+) -> Result<Json<Vec<WriteToken>>, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    Ok(Json(state.database.list_write_tokens()?))
+}
+
+async fn create_write_token(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Json(input): Json<WriteTokenInput>,
+) -> Result<(StatusCode, Json<WriteTokenCreated>), ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("write token name is required"));
+    }
+    let secret = write_token_secret();
+    let token = state
+        .database
+        .create_write_token(name, &sha256_hex(secret.as_bytes()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(WriteTokenCreated {
+            id: token.id,
+            name: token.name,
+            secret,
+            created_at: token.created_at,
+        }),
+    ))
+}
+
+async fn remove_write_token(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    if !state.database.delete_write_token(&id)? {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// The audit trail shows the latest publishes to root; the cap keeps the
+// response bounded while the table itself keeps every event.
+const PUBLISH_EVENTS_LIMIT: i64 = 50;
+
+async fn list_publish_events(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthMiniPrincipal>,
+) -> Result<Json<Vec<PublishEvent>>, ApiError> {
+    Actor::from_principal(&state.database, &principal)?.assert_root()?;
+    Ok(Json(
+        state.database.list_publish_events(PUBLISH_EVENTS_LIMIT)?,
+    ))
+}
+
+async fn publish_file(
+    State(state): State<AppState>,
+    Path((dataset_id, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let secret =
+        bearer_token(&headers).ok_or_else(|| ApiError::unauthorized("write token is required"))?;
+    let token = state
+        .database
+        .write_token_by_secret_hash(&sha256_hex(secret.as_bytes()))?
+        .ok_or_else(|| ApiError::unauthorized("unknown write token"))?;
+    if state.database.dataset(&dataset_id)?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    let relative = normalize_publish_path(&path)
+        .ok_or_else(|| ApiError::bad_request("invalid publish path"))?;
+    let target = state
+        .database
+        .dataset_directory(&dataset_id)
+        .join(&relative);
+    write_file_atomically(&target, &body).map_err(|error| ApiError::files(&error))?;
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    let size = body.len() as u64;
+    let sha256 = sha256_hex(&body);
+    state.database.record_publish_event(
+        &dataset_id,
+        &normalized,
+        size,
+        &sha256,
+        &token.id,
+        &token.name,
+    )?;
+    state
+        .database
+        .touch_write_token(&token.id, Utc::now().timestamp())?;
+    Ok(Json(json!({
+        "path": normalized,
+        "size": size,
+        "sha256": sha256,
+    })))
+}
+
 async fn get_linkit(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
@@ -589,6 +760,13 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: message.into(),
         }
     }

@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useAuthMini } from "auth-mini-react-components"
 import { LinkitProvider, useLinkit } from "linkit-react-components"
 import { Navigate, Route, Routes, useLocation } from "react-router-dom"
-import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, LayoutDashboardIcon, RefreshCwIcon } from "lucide-react"
+import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, KeyRoundIcon, LayoutDashboardIcon, RefreshCwIcon } from "lucide-react"
 import { AppLayout, type AppNavGroup } from "@zccz14/ux"
 
 import { FirmamentMark } from "./components/firmament-mark"
@@ -19,6 +19,7 @@ import type { LinkitStatus, Me } from "./lib/types"
 import { DatasetsPage } from "./pages/datasets-page"
 import { LinkitPage } from "./pages/linkit-page"
 import { OverviewPage } from "./pages/overview-page"
+import { PublishPage } from "./pages/publish-page"
 import { SetupPage } from "./pages/setup-page"
 import { SyncPage } from "./pages/sync-page"
 import { SystemResourcesPage } from "./pages/system-resources-page"
@@ -92,6 +93,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
         { to: "/datasets", label: t.datasets, icon: <DatabaseIcon /> },
         { to: "/sync", label: t.sync, icon: <HardDriveDownloadIcon /> },
         { to: "/linkit", label: t.linkit, icon: <BotIcon /> },
+        ...(me.data.is_root ? [{ to: "/publish", label: t.publish, icon: <KeyRoundIcon /> }] : []),
       ],
     },
     ...(me.data.is_root ? [{ label: t.navSystem, items: [{ to: "/system", label: t.systemResources, icon: <HardDriveIcon /> }] }] : []),
@@ -112,6 +114,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
           <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} isRoot={me.data.is_root} />} />
           <Route path="/sync" element={<SyncPage auth={auth} locale={locale} t={t} />} />
           <Route path="/linkit" element={<LinkitPage auth={auth} locale={locale} t={t} />} />
+          <Route path="/publish" element={me.data.is_root ? <PublishPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
           <Route path="/system" element={me.data.is_root ? <SystemResourcesPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
           <Route path="/setup" element={<SetupPage auth={auth} t={t} onDone={refresh} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
@@ -125,6 +128,7 @@ function pageTitle(pathname: string, t: Copy) {
   if (pathname.startsWith("/datasets")) return t.datasets
   if (pathname.startsWith("/sync")) return t.sync
   if (pathname === "/linkit") return t.linkit
+  if (pathname === "/publish") return t.publish
   if (pathname === "/system") return t.systemResources
   return t.overview
 }

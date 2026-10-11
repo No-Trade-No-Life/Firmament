@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ArchiveIcon, DownloadIcon, FolderOpenIcon } from "lucide-react"
+import { ArchiveIcon, DownloadIcon, FolderOpenIcon, PlusIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -17,7 +17,10 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Textarea } from "@/components/ui/textarea"
 import { downloadFile, request, type AuthSdk } from "../lib/api"
 import { formatBytes, formatTime, showError } from "../lib/format"
 import type { Copy } from "../lib/i18n"
@@ -26,6 +29,7 @@ import type { ArchiveJob, Dataset, DatasetManifest } from "../lib/types"
 export function DatasetsPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale: string; t: Copy; isRoot: boolean }) {
   const datasets = useQuery({ queryKey: ["datasets"], queryFn: () => request<Dataset[]>("/api/v1/datasets", auth) })
   const [openId, setOpenId] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
   const manifest = useQuery({
     queryKey: ["manifest", openId],
     queryFn: () => request<DatasetManifest>(`/api/v1/datasets/${openId}/manifest`, auth),
@@ -35,9 +39,12 @@ export function DatasetsPage({ auth, locale, t, isRoot }: { auth: AuthSdk; local
   const openDataset = list.find((dataset) => dataset.id === openId) ?? null
 
   return <div className="flex flex-col gap-6">
-    <div>
-      <h1 className="m-0 text-2xl font-semibold tracking-tight">{t.datasetsTitle}</h1>
-      <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{t.datasetsDescription}</p>
+    <div className="flex items-start justify-between gap-4">
+      <div>
+        <h1 className="m-0 text-2xl font-semibold tracking-tight">{t.datasetsTitle}</h1>
+        <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{t.datasetsDescription}</p>
+      </div>
+      {isRoot && <Button size="sm" onClick={() => setCreating(true)}><PlusIcon data-icon="inline-start" />{t.newDataset}</Button>}
     </div>
     {list.length === 0 ? <p className="text-sm text-muted-foreground">{t.noDatasets}</p> : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {list.map((dataset) => <Card key={dataset.id}>
@@ -74,7 +81,44 @@ export function DatasetsPage({ auth, locale, t, isRoot }: { auth: AuthSdk; local
         </Table>}
       </DialogContent>
     </Dialog>
+    <CreateDatasetDialog auth={auth} t={t} open={creating} onOpenChange={setCreating} />
   </div>
+}
+
+function CreateDatasetDialog({ auth, t, open, onOpenChange }: { auth: AuthSdk; t: Copy; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const queryClient = useQueryClient()
+  const [id, setId] = useState("")
+  const [name, setName] = useState("")
+  const [description, setDescription] = useState("")
+  const idOk = /^[a-z0-9][a-z0-9-]{0,63}$/.test(id)
+  const create = useMutation({
+    mutationFn: () => request<Dataset>("/api/v1/datasets", auth, { method: "POST", body: JSON.stringify({ id, name, description }) }),
+    onSuccess: () => {
+      toast.success(t.datasetCreated)
+      void queryClient.invalidateQueries({ queryKey: ["datasets"] })
+      setId("")
+      setName("")
+      setDescription("")
+      onOpenChange(false)
+    },
+    onError: showError,
+  })
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent>
+      <DialogHeader><DialogTitle>{t.newDataset}</DialogTitle><DialogDescription>{t.datasetIdHint}</DialogDescription></DialogHeader>
+      <form className="flex flex-col gap-4" onSubmit={(event) => { event.preventDefault(); create.mutate() }}>
+        <FieldGroup>
+          <Field><FieldLabel htmlFor="dataset-id">{t.datasetId}</FieldLabel><Input id="dataset-id" value={id} onChange={(event) => setId(event.target.value.toLowerCase())} placeholder={t.datasetIdPlaceholder} required /></Field>
+          <Field><FieldLabel htmlFor="dataset-name">{t.datasetNameField}</FieldLabel><Input id="dataset-name" value={name} onChange={(event) => setName(event.target.value)} required /></Field>
+          <Field><FieldLabel htmlFor="dataset-description">{t.datasetDescriptionField}</FieldLabel><Textarea id="dataset-description" value={description} onChange={(event) => setDescription(event.target.value)} rows={3} /></Field>
+        </FieldGroup>
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>{t.cancel}</Button>
+          <Button type="submit" disabled={create.isPending || !idOk || name.trim() === ""}>{create.isPending ? t.creating : t.create}</Button>
+        </div>
+      </form>
+    </DialogContent>
+  </Dialog>
 }
 
 function ArchiveControls({ auth, dataset, t }: { auth: AuthSdk; dataset: Dataset; t: Copy }) {

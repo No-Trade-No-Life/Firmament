@@ -67,6 +67,28 @@ export type ColdSettings = {
   region: string
 }
 
+export type WriteToken = {
+  id: string
+  name: string
+  created_at: number
+  last_used_at: number | null
+}
+
+export type WriteTokenCreated = WriteToken & {
+  secret: string
+}
+
+export type PublishEvent = {
+  id: string
+  dataset_id: string
+  path: string
+  size: number
+  sha256: string
+  token_id: string
+  token_name: string
+  created_at: number
+}
+
 export type SystemResources = {
   sampled_at: number
   cpu: { usage_percent: number; load_1m: number; logical_cpus: number }
