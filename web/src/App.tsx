@@ -103,7 +103,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
     <TooltipProvider>
       <Toaster position="top-center" theme={resolvedTheme} />
       <AppLayout
-        logo={{ light: <FirmamentMark className="size-7 shrink-0" />, dark: <FirmamentMark className="size-7 shrink-0" /> }}
+        logo={<FirmamentMark className="size-7 shrink-0" />}
         title={t.appName}
         nav={nav}
         pageTitle={pageTitle(location.pathname, t)}
