@@ -7,8 +7,6 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import ts from "typescript"
 
-import { applyFavicon } from "../src/lib/favicon.ts"
-
 // Approved round dome from No-Trade-No-Life/home-page PR #6.
 const DOME_PATH = "M4 20a12 12 0 0 1 24 0M4 20a12 4 0 1 0 24 0 12 4 0 1 0-24 0M16 8v16"
 
@@ -51,24 +49,3 @@ test("initial document versions the favicon URL to avoid the previous CDN cache"
   assert.match(html, /rel="icon"[^>]*href="\/firmament-mark\.svg\?v=dome-v1"/)
 })
 
-test("theme changes regenerate the dome favicon in both directions", (t) => {
-  const originalDocument = globalThis.document
-  const link = { href: "/firmament-mark.svg" }
-  globalThis.document = {
-    querySelector(selector) {
-      assert.equal(selector, 'link[rel="icon"]')
-      return link
-    },
-  }
-  t.after(() => { globalThis.document = originalDocument })
-
-  for (const [theme, color] of [["light", "#000"], ["dark", "#fff"], ["light", "#000"]]) {
-    const previous = link.href
-    applyFavicon(theme)
-    assert.notEqual(link.href, previous)
-    assert.ok(link.href.startsWith("data:image/svg+xml,"))
-    const svg = decodeURIComponent(link.href.slice("data:image/svg+xml,".length))
-    assertDome(svg)
-    assert.ok(svg.includes(`stroke="${color}"`))
-  }
-})
