@@ -13,7 +13,6 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { request, type AuthSdk } from "./lib/api"
-import { applyFavicon } from "./lib/favicon"
 import { copy, initialLocale, negotiateLocale, persistLocale, type Copy, type Locale } from "./lib/i18n"
 import type { LinkitStatus, Me } from "./lib/types"
 import { DatasetsPage } from "./pages/datasets-page"
@@ -33,7 +32,7 @@ export default function App() {
   }, [locale])
   const t = copy[locale]
   if (!isReady || !isAuthenticated || !sdk) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{t.signin}</div>
-  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><FaviconSync /><LinkitAutoEnsure auth={sdk} /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
+  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><LinkitAutoEnsure auth={sdk} /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
 }
 
 // The signed-in Linkit profile owns the language preference; follow it
@@ -44,15 +43,6 @@ function LinkitLanguageSync({ setLocale }: { setLocale: (locale: Locale) => void
     const next = negotiateLocale(languages)
     if (next) setLocale(next)
   }, [languages, setLocale])
-  return null
-}
-
-// Keep the favicon in step with the resolved theme without a reload.
-function FaviconSync() {
-  const { resolvedTheme } = useLinkit()
-  useEffect(() => {
-    applyFavicon(resolvedTheme)
-  }, [resolvedTheme])
   return null
 }
 
