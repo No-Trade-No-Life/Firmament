@@ -43,7 +43,7 @@ Firmament 是一块**黑板**：数据由**外部进程发布**——脚本、Cy
 需要 Rust 1.93 与 Node.js 24：
 
 ```bash
-cd web && npm ci && npm run lint && npm test && npm run build && cd ..
+cd web && pnpm install --frozen-lockfile && pnpm run lint && pnpm test && pnpm run build && cd ..
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
