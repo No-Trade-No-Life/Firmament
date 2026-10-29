@@ -17,7 +17,6 @@ axum = "0.8"
 base64 = "0.22"
 bytes = "1.12.1"
 chrono = { version = "0.4", features = ["clock"] }
-chrono-tz = "0.10.4"
 http = "1"
 mime_guess = "2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }

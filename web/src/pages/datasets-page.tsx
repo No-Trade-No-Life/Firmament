@@ -26,7 +26,6 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [cadence, setCadence] = useState<CoolingCadence>("daily")
-  const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
   const [granularity, setGranularity] = useState<Granularity>("day")
   const [columns, setColumns] = useState<ColumnDraft[]>(starterColumns)
   const problem = schemaProblem(columns, t)
@@ -35,7 +34,7 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
   const create = useMutation({
     mutationFn: () => request<DatasetView>("/api/v1/datasets", auth, {
       method: "POST",
-      body: JSON.stringify({ id, name, description, cooling: { cadence, timezone }, table: buildTableSpec(columns, granularity) }),
+      body: JSON.stringify({ id, name, description, cadence, table: buildTableSpec(columns, granularity) }),
     }),
     onSuccess: () => {
       setCreating(false)
@@ -73,7 +72,7 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
             <Badge variant="secondary" className="text-xs">{t.granularity} · {granularityLabel(dataset.table.granularity, t)}</Badge>
           </div>
           <div className="text-xs text-muted-foreground">
-            <p>{t.coolingTitle} {cadenceLabel(dataset.cooling.cadence, t)} · {dataset.cooling.timezone}</p>
+            <p>{t.coolingTitle} {cadenceLabel(dataset.cadence, t)} · UTC</p>
             <p>{t.hotRows} {dataset.table.rows.toLocaleString()}{dataset.table.coolable_rows > 0 ? ` · ${t.coolableRows} ${dataset.table.coolable_rows.toLocaleString()}` : ""}</p>
             <p>{t.coldFiles} {dataset.table.cold_files} · {t.coldBytes} {formatBytes(dataset.table.cold_bytes)}</p>
           </div>
@@ -134,11 +133,6 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
             </div>
             <FieldDescription>{t.coolingHint}</FieldDescription>
             <FieldDescription>{t.granularityHint}</FieldDescription>
-            <Field>
-              <FieldLabel htmlFor="dataset-timezone">{t.timezone}</FieldLabel>
-              <Input id="dataset-timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} className="max-w-64" required />
-              <FieldDescription>{t.timezoneHint}</FieldDescription>
-            </Field>
             <Field>
               <FieldLabel>{t.schemaTitle}</FieldLabel>
               <SchemaEditor columns={columns} onChange={setColumns} t={t} />

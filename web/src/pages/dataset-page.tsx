@@ -51,7 +51,7 @@ export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale
         <div className="flex flex-wrap items-center gap-2">
           <h1 className="m-0 text-2xl font-semibold tracking-tight">{value.name}</h1>
           <Badge variant="outline" className="font-mono text-xs">{value.id}</Badge>
-          <Badge variant="secondary" className="text-xs">{cadenceLabel(value.cooling.cadence, t)} · {value.cooling.timezone}</Badge>
+          <Badge variant="secondary" className="text-xs">{cadenceLabel(value.cadence, t)} · UTC</Badge>
         </div>
         <p className="max-w-3xl text-sm text-muted-foreground">{value.description || "—"}</p>
       </div>

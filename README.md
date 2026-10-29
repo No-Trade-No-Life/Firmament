@@ -8,7 +8,7 @@ Firmament 是一台**冷却器**：每个数据集就是一张表，一份 schem
 
 ```
 数据集（一张表）  │←──── 冷：Parquet，只追加 ────│←── 热：SQLite，可写可改 ──→│
-                                     冷却线 = 当前周期起点（cadence + timezone）
+                                     冷却线 = 当前周期起点（按 cadence 在 UTC 切）
 ```
 
 它不是网盘（没有任意路径，只有声明好的表），不是数据库服务（不承诺查询），也不是传输工具
@@ -16,27 +16,27 @@ Firmament 是一台**冷却器**：每个数据集就是一张表，一份 schem
 
 ## 概念
 
-- **数据集**：一张表的全部 —— 建库时声明的表结构、一个冷却日历（`cadence` + `timezone`），
+- **数据集**：一张表的全部 —— 建库时声明的表结构、一个冷却节奏（`cadence`），
   以及由它派生出的冷库树。
 - **表**：主键、时间列（`timestamp`）、冷库分区粒度（`hour` / `day` / `month`）与列定义，
   创建后不可变更。一个数据集只有一张表，热库里就是一张 `data` 表。
-- **冷却日历**：`daily` / `weekly`（周一起）/ `monthly`，时区取 IANA 名（如 `Asia/Shanghai`）。
+- **冷却节奏**：`daily` / `weekly`（周一起）/ `monthly`。时间一律按 UTC 理解，没有时区配置。
 - **热库**：可写 `SQLite`，装当前日历周期的行；周期内随便改。
-- **冷却线**：当前周期的起点 —— `daily` → 当地今天 00:00，`weekly` → 本周一 00:00，
-  `monthly` → 本月 1 日 00:00。早于它的行才可冷却。
+- **冷却线**：当前周期的 UTC 起点 —— `daily` → 今天 00:00Z，`weekly` → 本周一 00:00Z，
+  `monthly` → 本月 1 日 00:00Z。早于它的行才可冷却。
 - **冷却不清空热库**：只删掉已导出成冷库的那部分行，当前周期永远留在可写的热库里。
 - **冷库**：不可变的 Parquet 树 + 每个批次一份 catalogue，写在 S3 上，可脱离应用独立读取。
 - **分区粒度与冷却节奏正交**：每天冷却一次的数据也可以按小时或按月切分区。
 
 ## 写入
 
-root 在「数据集」页创建数据集，一次声明冷却日历与表结构（JSON）。例如：
+root 在「数据集」页创建数据集，一次声明冷却节奏与表结构（逐列用表格建模）。请求体例如：
 
 ```json
 {
   "id": "okx-btc-swap",
   "name": "OKX BTC 永续",
-  "cooling": { "cadence": "daily", "timezone": "Asia/Shanghai" },
+  "cadence": "daily",
   "table": {
     "primary_key": ["symbol", "updated_at"],
     "time_column": "updated_at",
@@ -73,7 +73,7 @@ curl -X POST "https://firma.ntnl.io/api/v1/ingest/okx-btc-swap" \
 提交点是桶里的 `_catalog/{batch}.json`：提交前失败热库不动，提交后崩溃只会重复导出同一批。
 一轮冷却只处理时间列早于冷却线的行，所以热库里始终留着当前周期。
 
-分区桶在数据集声明的时区里切（`day=2026-10-01` 指那里的那个日历日），粒度由表声明：
+分区桶按 UTC 切（`day=2026-10-01` 指 UTC 的那个日历日），粒度由表声明：
 
 ```
 datasets/{dataset}/day=2026-10-01/000007-0000.parquet

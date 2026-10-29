@@ -131,16 +131,8 @@ async fn sweep_once(database: &Database, cold: &dyn ColdStore) {
                 continue;
             }
         }
-        let boundary = match cooling::boundary(now, &dataset.cooling) {
-            Ok(boundary) => boundary.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            Err(message) => {
-                eprintln!(
-                    "firmament: {} cooling calendar invalid: {message}",
-                    dataset.id
-                );
-                continue;
-            }
-        };
+        let boundary = cooling::boundary(now, dataset.cadence)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let coolable = match database
             .hot()
             .coolable_rows(&dataset.id, &dataset.table, &boundary)
