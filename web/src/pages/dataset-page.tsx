@@ -20,7 +20,7 @@ import { formatBytes, formatRange, formatTime, showError } from "../lib/format"
 import { cadenceLabel, granularityLabel, type Copy } from "../lib/i18n"
 import { Pager } from "../components/pager"
 import { SchemaSummary } from "../components/schema-editor"
-import type { ColdFile, DatasetView, Flush, FlushResult, Manifest, TableView } from "../lib/types"
+import type { ColdFile, CoolingRequest, DatasetView, Flush, Manifest, TableView } from "../lib/types"
 
 export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale: string; t: Copy; isRoot: boolean }) {
   const { id = "" } = useParams()
@@ -29,9 +29,9 @@ export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale
   const flushes = useQuery({ queryKey: ["flushes", id], queryFn: () => request<Flush[]>(`/api/v1/datasets/${id}/flushes`, auth), enabled: id !== "" })
   const manifest = useQuery({ queryKey: ["manifest", id, "all"], queryFn: () => request<Manifest>(`/api/v1/datasets/${id}/manifest?since=0`, auth), enabled: id !== "" })
   const flush = useMutation({
-    mutationFn: () => request<FlushResult>(`/api/v1/datasets/${id}/flushes`, auth, { method: "POST" }),
+    mutationFn: () => request<CoolingRequest>(`/api/v1/datasets/${id}/flushes`, auth, { method: "POST" }),
     onSuccess: (result) => {
-      toast.success(`${t.flushed} · batch ${result.batch} · ${result.files} ${t.files}`)
+      toast.success(`${t.coolingRequested} · ${result.coolable_rows.toLocaleString()} ${t.rows}`)
       void queryClient.invalidateQueries()
     },
     onError: (error) => showError(error instanceof Error ? error : new Error(String(error))),
@@ -87,21 +87,21 @@ export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale
       <CardContent>
         {(flushes.data ?? []).length === 0 ? <p className="text-sm text-muted-foreground">{t.noFlushes}</p> : <Table>
           <TableHeader><TableRow>
-            <TableHead>{t.batch}</TableHead>
+            <TableHead>{t.pass}</TableHead>
             <TableHead>{t.status}</TableHead>
             <TableHead>{t.trigger}</TableHead>
-            <TableHead>{t.files}</TableHead>
+            <TableHead>{t.partitions}</TableHead>
             <TableHead>{t.rows}</TableHead>
             <TableHead>{t.bytes}</TableHead>
             <TableHead>{t.startedAt}</TableHead>
           </TableRow></TableHeader>
           <TableBody>{(flushes.data ?? []).map((entry) => <TableRow key={entry.id}>
-            <TableCell className="font-mono text-xs">{entry.batch}</TableCell>
+            <TableCell className="font-mono text-xs">{entry.pass}</TableCell>
             <TableCell><Badge variant={entry.status === "failed" ? "destructive" : entry.status === "completed" ? "secondary" : "outline"}>
               {statusLabel(entry, t)}
             </Badge></TableCell>
             <TableCell className="text-muted-foreground">{entry.trigger}</TableCell>
-            <TableCell>{entry.files}</TableCell>
+            <TableCell>{entry.partitions}</TableCell>
             <TableCell>{entry.rows.toLocaleString()}</TableCell>
             <TableCell className="text-muted-foreground">{formatBytes(entry.bytes)}</TableCell>
             <TableCell className="text-muted-foreground">{formatTime(entry.created_at, locale)}</TableCell>
@@ -136,7 +136,8 @@ function ColdFilesTable({ files, datasetId, auth, t }: {
         }}><DownloadIcon /></Button>
       </div>,
     }),
-    coldColumns.accessor("partition", { header: () => t.partition, cell: (info) => <span className="font-mono text-xs text-muted-foreground">{info.getValue()}</span> }),
+    coldColumns.accessor("bucket", { header: () => t.partition, cell: (info) => <span className="font-mono text-xs text-muted-foreground">{info.getValue()}</span> }),
+    coldColumns.accessor("revision", { header: () => t.revision, cell: (info) => <span className="font-mono text-xs">{info.getValue()}</span> }),
     coldColumns.accessor("rows", { header: () => t.rows, cell: (info) => info.getValue().toLocaleString() }),
     coldColumns.accessor("bytes", { header: () => t.bytes, cell: (info) => <span className="text-muted-foreground">{formatBytes(info.getValue())}</span> }),
   ]), [auth, datasetId, t])
