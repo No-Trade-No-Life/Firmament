@@ -21,7 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::cold::{ColdStore, object_key};
-use crate::cooling::{self, CoolingSpec};
+use crate::cooling::Cadence;
 use crate::crypto::write_token_secret;
 use crate::db::{
     DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, Flush, IngestEvent,
@@ -212,7 +212,7 @@ struct DatasetView {
     id: String,
     name: String,
     description: String,
-    cooling: CoolingSpec,
+    cadence: Cadence,
     last_batch: i64,
     created_at: i64,
     table: TableView,
@@ -220,8 +220,7 @@ struct DatasetView {
 
 fn dataset_view(database: &Database, id: &str) -> Result<DatasetView, ApiError> {
     let dataset = database.dataset(id)?.ok_or_else(ApiError::not_found)?;
-    // INVARIANT: the cooling calendar was validated when the dataset was created.
-    let boundary = cooling_boundary(Utc::now(), &dataset.cooling).map_err(ApiError::internal)?;
+    let boundary = cooling_boundary(Utc::now(), dataset.cadence);
     let stats = database
         .hot()
         .stats(&dataset.id, &dataset.table, &boundary)?;
@@ -230,7 +229,7 @@ fn dataset_view(database: &Database, id: &str) -> Result<DatasetView, ApiError> 
         id: dataset.id,
         name: dataset.name,
         description: dataset.description,
-        cooling: dataset.cooling,
+        cadence: dataset.cadence,
         last_batch: dataset.last_batch,
         created_at: dataset.created_at,
         table: TableView {
@@ -263,7 +262,7 @@ struct DatasetInput {
     id: String,
     name: String,
     description: Option<String>,
-    cooling: CoolingSpec,
+    cadence: Cadence,
     table: TableSpec,
 }
 
@@ -293,11 +292,10 @@ async fn create_dataset(
     if name.is_empty() {
         return Err(ApiError::bad_request("dataset name is required"));
     }
-    cooling::validate(&input.cooling).map_err(ApiError::bad_request)?;
     schema::validate(&input.table).map_err(ApiError::bad_request)?;
     state
         .database
-        .create_dataset(&id, name, &description, &input.cooling, &input.table)?;
+        .create_dataset(&id, name, &description, input.cadence, &input.table)?;
     Ok((
         StatusCode::CREATED,
         Json(dataset_view(&state.database, &id)?),
@@ -350,7 +348,7 @@ struct RowsQuery {
 #[derive(Debug, Serialize)]
 struct RowsView {
     dataset_id: String,
-    cooling: CoolingSpec,
+    cadence: Cadence,
     rows: Vec<Map<String, Value>>,
 }
 
@@ -371,7 +369,7 @@ async fn dataset_rows(
             .rows(&dataset.id, &dataset.table, query.since.as_deref(), limit)?;
     Ok(Json(RowsView {
         dataset_id: dataset.id,
-        cooling: dataset.cooling,
+        cadence: dataset.cadence,
         rows: rows
             .iter()
             .map(|values| row_json(&dataset.table, values))
@@ -879,7 +877,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::dataset_view;
-    use crate::cooling::{Cadence, CoolingSpec};
+    use crate::cooling::Cadence;
     use crate::db::Database;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
@@ -909,16 +907,7 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset(
-                "bars",
-                "Bars",
-                "",
-                &CoolingSpec {
-                    cadence: Cadence::Daily,
-                    timezone: "UTC".to_owned(),
-                },
-                &klines(),
-            )
+            .create_dataset("bars", "Bars", "", Cadence::Daily, &klines())
             .expect("dataset creates");
         let table = klines();
         database

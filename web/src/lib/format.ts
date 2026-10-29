@@ -1,7 +1,7 @@
 import { toast } from "sonner"
 
 export function formatTime(timestamp?: number | null, locale?: string) {
-  return timestamp ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }).format(new Date(timestamp * 1000)) : "—"
+  return timestamp ? `${new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }).format(new Date(timestamp * 1000))} UTC` : "—"
 }
 
 export function formatTimeAgo(timestamp?: number | null, locale?: string) {
@@ -42,7 +42,7 @@ export function formatRange(from?: string | null, to?: string | null, locale?: s
     const date = new Date(instant)
     return Number.isNaN(date.getTime())
       ? instant
-      : new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(date)
+      : new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short", timeZone: "UTC" }).format(date)
   }
-  return `${short(from)} → ${short(to)}`
+  return `${short(from)} → ${short(to)} UTC`
 }

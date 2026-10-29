@@ -47,7 +47,7 @@ export function OverviewPage({ auth, t }: { auth: AuthSdk; t: Copy }) {
             </TableRow></TableHeader>
             <TableBody>{list.map((dataset) => <TableRow key={dataset.id}>
               <TableCell><Link className="font-medium hover:underline" to={`/datasets/${dataset.id}`}>{dataset.name}</Link></TableCell>
-              <TableCell className="text-muted-foreground">{cadenceLabel(dataset.cooling.cadence, t)} · {dataset.cooling.timezone}</TableCell>
+              <TableCell className="text-muted-foreground">{cadenceLabel(dataset.cadence, t)} · UTC</TableCell>
               <TableCell>{dataset.table.rows.toLocaleString()}</TableCell>
               <TableCell>{dataset.table.cold_files}</TableCell>
               <TableCell className="text-muted-foreground">{formatBytes(dataset.table.cold_bytes)}</TableCell>

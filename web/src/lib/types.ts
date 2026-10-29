@@ -8,11 +8,6 @@ export type ColumnType = "integer" | "real" | "text" | "boolean" | "timestamp"
 
 export type CoolingCadence = "daily" | "weekly" | "monthly"
 
-export type CoolingSpec = {
-  cadence: CoolingCadence
-  timezone: string
-}
-
 export type Granularity = "hour" | "day" | "month"
 
 export type ColumnSpec = {
@@ -43,7 +38,7 @@ export type DatasetView = {
   id: string
   name: string
   description: string
-  cooling: CoolingSpec
+  cadence: CoolingCadence
   last_batch: number
   created_at: number
   table: TableView
@@ -136,7 +131,7 @@ export type IngestEvent = {
 
 export type RowsResponse = {
   dataset_id: string
-  cooling: CoolingSpec
+  cadence: CoolingCadence
   rows: Record<string, unknown>[]
 }
 

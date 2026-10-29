@@ -14,7 +14,7 @@ use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value as Json};
 
-use crate::cooling::{self, CoolingSpec};
+use crate::cooling;
 use crate::schema::{self, ColumnSpec, HOT_TABLE, TableSpec, Value};
 
 /// State of the hot store of one dataset.
@@ -332,7 +332,6 @@ impl HotStore {
         &self,
         dataset_id: &str,
         table: &TableSpec,
-        cooling: &CoolingSpec,
         batch: i64,
     ) -> Result<Vec<HotRow>, HotError> {
         let connection = self.connection(dataset_id)?;
@@ -358,8 +357,8 @@ impl HotStore {
                         "the hot table holds a row without a timestamp".to_owned(),
                     ));
                 };
-                let bucket = cooling::bucket(table.granularity, cooling, timestamp)
-                    .map_err(HotError::Invalid)?;
+                let bucket =
+                    cooling::bucket(table.granularity, timestamp).map_err(HotError::Invalid)?;
                 Ok(HotRow {
                     values: values.clone(),
                     bucket,
@@ -489,7 +488,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::HotStore;
-    use crate::cooling::CoolingSpec;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
     fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
@@ -569,15 +567,13 @@ mod tests {
                 .expect("claim"),
             1
         );
-        let claimed = store
-            .claimed("demo", &table, &CoolingSpec::default(), 3)
-            .expect("claimed");
+        let claimed = store.claimed("demo", &table, 3).expect("claimed");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].bucket, "2026-09-01");
         store.release("demo", 3).expect("release");
         assert!(
             store
-                .claimed("demo", &table, &CoolingSpec::default(), 3)
+                .claimed("demo", &table, 3)
                 .expect("claimed")
                 .is_empty()
         );
@@ -609,7 +605,7 @@ mod tests {
             .expect("rewrite");
         assert!(
             store
-                .claimed("demo", &table, &CoolingSpec::default(), 1)
+                .claimed("demo", &table, 1)
                 .expect("claimed")
                 .is_empty(),
             "a rewrite clears the claim so the new version is flushed again"

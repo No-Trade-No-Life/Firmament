@@ -14,14 +14,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::cooling::{Cadence, CoolingSpec};
+use crate::cooling::Cadence;
 use crate::crypto::{Cipher, CipherError};
 use crate::hot::HotStore;
 use crate::schema::{self, TableSpec};
 
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
-/// One dataset: one declared table, its cooling calendar and a cold catalog.
+/// One dataset: one declared table, its cooling cadence and a cold catalog.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Dataset {
     /// Slug identifying the dataset.
@@ -30,8 +30,8 @@ pub struct Dataset {
     pub name: String,
     /// Free-form description.
     pub description: String,
-    /// When the hot window rolls over, in which calendar.
-    pub cooling: CoolingSpec,
+    /// How often the hot window rolls over.
+    pub cadence: Cadence,
     /// Sequence number of the last committed flush batch.
     pub last_batch: i64,
     /// Creation timestamp.
@@ -265,7 +265,6 @@ impl Database {
                 description TEXT NOT NULL,
                 spec TEXT NOT NULL,
                 cadence TEXT NOT NULL,
-                timezone TEXT NOT NULL,
                 last_batch INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
@@ -390,7 +389,7 @@ impl Database {
         id: &str,
         name: &str,
         description: &str,
-        cooling: &CoolingSpec,
+        cadence: Cadence,
         table: &TableSpec,
     ) -> Result<Dataset, DatabaseError> {
         schema::validate(table).map_err(DatabaseError::Conflict)?;
@@ -401,8 +400,8 @@ impl Database {
         })?;
         let created_at = Utc::now().timestamp();
         let inserted = self.connection()?.execute(
-            "INSERT INTO datasets(id, name, description, spec, cadence, timezone, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7) ON CONFLICT(id) DO NOTHING",
-            params![id, name, description, spec, cooling.cadence.as_str(), cooling.timezone, created_at],
+            "INSERT INTO datasets(id, name, description, spec, cadence, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(id) DO NOTHING",
+            params![id, name, description, spec, cadence.as_str(), created_at],
         )?;
         if inserted == 0 {
             return Err(DatabaseError::Conflict(format!(
@@ -419,7 +418,7 @@ impl Database {
             id: id.to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
-            cooling: cooling.clone(),
+            cadence,
             last_batch: 0,
             created_at,
             table: table.clone(),
@@ -429,7 +428,7 @@ impl Database {
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
+            "SELECT id, name, description, spec, cadence, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
         )?;
         let datasets = statement
             .query_map([], dataset_from_row)?
@@ -440,7 +439,7 @@ impl Database {
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets WHERE id = ?1",
+                "SELECT id, name, description, spec, cadence, last_batch, created_at FROM datasets WHERE id = ?1",
                 [id],
                 dataset_from_row,
             )
@@ -950,18 +949,15 @@ fn dataset_from_row(row: &Row<'_>) -> rusqlite::Result<Dataset> {
         name: row.get(1)?,
         description: row.get(2)?,
         table,
-        cooling: CoolingSpec {
-            cadence: Cadence::parse(&cadence).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::other(format!("unknown cadence {cadence}"))),
-                )
-            })?,
-            timezone: row.get(5)?,
-        },
-        last_batch: row.get(6)?,
-        created_at: row.get(7)?,
+        cadence: Cadence::parse(&cadence).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!("unknown cadence {cadence}"))),
+            )
+        })?,
+        last_batch: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -1077,14 +1073,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::Database;
-    use crate::cooling::{Cadence, CoolingSpec};
+    use crate::cooling::Cadence;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
-    fn daily() -> CoolingSpec {
-        CoolingSpec {
-            cadence: Cadence::Daily,
-            timezone: "Asia/Shanghai".to_owned(),
-        }
+    fn daily() -> Cadence {
+        Cadence::Daily
     }
 
     fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
@@ -1115,13 +1108,12 @@ mod tests {
         assert!(database.list_datasets().expect("list").is_empty());
 
         let dataset = database
-            .create_dataset("bars", "Bars", "test", &daily(), &bars())
+            .create_dataset("bars", "Bars", "test", daily(), &bars())
             .expect("dataset creates");
-        assert_eq!(dataset.cooling.timezone, "Asia/Shanghai");
         assert_eq!(dataset.last_batch, 0);
         assert!(
             database
-                .create_dataset("bars", "Bars", "test", &daily(), &bars())
+                .create_dataset("bars", "Bars", "test", daily(), &bars())
                 .is_err(),
             "ids are unique"
         );
@@ -1135,7 +1127,7 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset("bars", "Bars", "", &daily(), &bars())
+            .create_dataset("bars", "Bars", "", daily(), &bars())
             .expect("dataset creates");
 
         let first = database.begin_flush("bars", "schedule").expect("first");
@@ -1172,7 +1164,7 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset("bars", "Bars", "", &daily(), &bars())
+            .create_dataset("bars", "Bars", "", daily(), &bars())
             .expect("dataset creates");
         let file = super::ColdFile {
             dataset_id: "bars".to_owned(),
@@ -1223,7 +1215,7 @@ mod tests {
         broken.primary_key.clear();
         assert!(
             database
-                .create_dataset("bars", "Bars", "", &daily(), &broken)
+                .create_dataset("bars", "Bars", "", daily(), &broken)
                 .is_err()
         );
         assert!(database.list_datasets().expect("list").is_empty());

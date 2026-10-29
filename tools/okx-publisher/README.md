@@ -12,7 +12,7 @@ Firmament 自身不做采集 —— 采集与调度都在发布者一侧。本�
 {
   "id": "okx-btc-swap",
   "name": "OKX BTC 永续 K 线",
-  "cooling": { "cadence": "daily", "timezone": "Asia/Shanghai" },
+  "cadence": "daily",
   "table": {
     "primary_key": ["symbol", "updated_at"],
     "time_column": "updated_at",
@@ -36,7 +36,7 @@ Firmament 自身不做采集 —— 采集与调度都在发布者一侧。本�
 {
   "id": "okx-btc-swap-funding",
   "name": "OKX BTC 永续资金费率",
-  "cooling": { "cadence": "daily", "timezone": "Asia/Shanghai" },
+  "cadence": "daily",
   "table": {
     "primary_key": ["symbol", "updated_at"],
     "time_column": "updated_at",

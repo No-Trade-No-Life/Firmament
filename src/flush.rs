@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::cold::{self, ColdObjectMetadata, ColdStore, object_key, rows_to_parquet};
-use crate::cooling::{self, CoolingSpec};
+use crate::cooling::{self, Cadence};
 use crate::db::{ColdFile, Database, Dataset};
 use crate::files::sha256_hex;
 use crate::hot::{self, HotRow, HotStore};
@@ -40,13 +40,8 @@ pub struct FlushReport {
 ///
 /// Everything older than this belongs to a period that already rolled over, so
 /// it is exactly the set of rows that may cool. The current period stays hot.
-///
-/// # Errors
-///
-/// Returns an error when the dataset carries an unknown timezone.
-pub fn cooling_boundary(now: DateTime<Utc>, cooling: &CoolingSpec) -> Result<String, String> {
-    cooling::boundary(now, cooling)
-        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+pub fn cooling_boundary(now: DateTime<Utc>, cadence: Cadence) -> String {
+    cooling::boundary(now, cadence).to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 /// Runs one cooling pass over a dataset.
@@ -101,7 +96,7 @@ async fn cool(
     hot.purge_stale_claims(&dataset.id, batch)
         .map_err(|error| error.to_string())?;
     let now = Utc::now();
-    let boundary = cooling_boundary(now, &dataset.cooling)?;
+    let boundary = cooling_boundary(now, dataset.cadence);
     let mut report = FlushReport {
         batch,
         ..FlushReport::default()
@@ -113,7 +108,7 @@ async fn cool(
         .map_err(|error| error.to_string())?;
     if claimed > 0 {
         let rows = hot
-            .claimed(&dataset.id, &dataset.table, &dataset.cooling, batch)
+            .claimed(&dataset.id, &dataset.table, batch)
             .map_err(|error| error.to_string())?;
         for (bucket, group) in group_by_bucket(&rows) {
             for chunk in group.chunks(FILE_ROWS) {
@@ -238,7 +233,7 @@ mod tests {
 
     use super::{cooling_boundary, run_flush};
     use crate::cold::{ColdError, ColdObjectBody, ColdObjectHead, ColdObjectMetadata, ColdStore};
-    use crate::cooling::{Cadence, CoolingSpec};
+    use crate::cooling::Cadence;
     use crate::db::Database;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
@@ -339,16 +334,7 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database");
         database
-            .create_dataset(
-                "bars",
-                "Bars",
-                "",
-                &CoolingSpec {
-                    cadence: Cadence::Daily,
-                    timezone: "UTC".to_owned(),
-                },
-                &table(),
-            )
+            .create_dataset("bars", "Bars", "", Cadence::Daily, &table())
             .expect("dataset");
         (state, database)
     }
@@ -369,21 +355,13 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-10-05T13:45:00Z")
             .expect("parses")
             .with_timezone(&chrono::Utc);
-        let daily = CoolingSpec {
-            cadence: Cadence::Daily,
-            timezone: "UTC".to_owned(),
-        };
         assert_eq!(
-            cooling_boundary(now, &daily).expect("boundary"),
+            cooling_boundary(now, Cadence::Daily),
             "2026-10-05T00:00:00.000000Z"
         );
-        let monthly = CoolingSpec {
-            cadence: Cadence::Monthly,
-            timezone: "Asia/Shanghai".to_owned(),
-        };
         assert_eq!(
-            cooling_boundary(now, &monthly).expect("boundary"),
-            "2026-09-30T16:00:00.000000Z"
+            cooling_boundary(now, Cadence::Monthly),
+            "2026-10-01T00:00:00.000000Z"
         );
     }
 
