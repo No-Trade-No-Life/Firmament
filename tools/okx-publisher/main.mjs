@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 // OKX reference publisher for Firmament.
 //
-// Fetches BTC-USDT-SWAP perpetual-swap data from OKX's public API and pushes it
-// to a Firmament dataset through the publish endpoint, one file per time bucket:
+// Firmament never collects anything by itself: it owns a writable hot store and
+// cools it into Parquet. This script is the collecting half — it pulls
+// BTC-USDT-SWAP perpetual-swap data from OKX's public API. A dataset is one
+// table, so the two shapes live in two datasets:
 //
-//   klines-1m/YYYY-MM-DD.csv    1-minute candles   (timestamp,open,high,low,close,volume)
-//   funding-rate/YYYY-MM.csv    funding rates     (timestamp,funding_rate)
+//   <dataset>          klines  (symbol, updated_at, open, high, low, close, volume)
+//   <funding-dataset>  funding (symbol, updated_at, funding_rate)
 //
-// Only confirmed candles are written, so the current day's file stays a stable
-// prefix and can be republished as the day progresses. Timestamps are UTC.
+// `updated_at` is the instant the information was produced, which is what the
+// cold layout is partitioned by. Re-sending the same primary key replaces the
+// row, so the current minute can be overwritten as it settles.
 //
 // Usage:
 //   node main.mjs --write-token <secret> --since 2026-09-01 [options]
@@ -17,11 +20,13 @@
 //   --since <YYYY-MM-DD>     window start, inclusive (required)
 //   --until <YYYY-MM-DD>     window end, exclusive; defaults to now
 //   --base-url <url>         Firmament base URL (default http://127.0.0.1:8080)
-//   --dataset <id>           dataset id (default okx-btc-swap)
+//   --dataset <id>           klines dataset id (default okx-btc-swap)
+//   --funding-dataset <id>   funding dataset id (default <dataset>-funding)
 //   --inst <instId>          OKX instrument (default BTC-USDT-SWAP)
 //   --okx-base <url>         OKX API base (default https://www.okx.com)
 //   --pace-ms <ms>           delay between OKX requests (default 150)
-//   --dry-run                collect and render without publishing
+//   --batch <n>              rows per ingest request (default 1000)
+//   --dry-run                collect and count without writing
 
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -175,104 +180,89 @@ function isoMinute(ts) {
   return new Date(ts).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function groupBy(rows, keyOf) {
-  const groups = new Map();
-  for (const row of rows) {
-    const key = keyOf(row);
-    const group = groups.get(key) ?? [];
-    group.push(row);
-    groups.set(key, group);
-  }
-  return [...groups.entries()].sort(([left], [right]) => (left < right ? -1 : 1));
+function candleRow(inst, row) {
+  return {
+    symbol: inst,
+    updated_at: isoMinute(Number(row[0])),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5]),
+  };
 }
 
-function renderCandles(rows) {
-  const lines = ["timestamp,open,high,low,close,volume"];
-  for (const row of rows) {
-    lines.push(
-      `${isoMinute(Number(row[0]))},${row[1]},${row[2]},${row[3]},${row[4]},${row[5]}`,
-    );
-  }
-  return `${lines.join("\n")}\n`;
+function fundingRow(inst, record) {
+  return {
+    symbol: inst,
+    updated_at: isoMinute(Number(record.fundingTime)),
+    funding_rate: Number(record.fundingRate),
+  };
 }
 
-function renderFunding(rows) {
-  const lines = ["timestamp,funding_rate"];
-  for (const record of rows) {
-    lines.push(`${isoMinute(Number(record.fundingTime))},${record.fundingRate}`);
+async function ingest(context, dataset, label, rows) {
+  const url = `${context.baseUrl}/api/v1/ingest/${dataset}`;
+  let written = 0;
+  for (let index = 0; index < rows.length; index += context.batch) {
+    const chunk = rows.slice(index, index + context.batch);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${context.writeToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ upsert: chunk }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`ingest ${label} failed: HTTP ${response.status} ${detail}`);
+    }
+    written += chunk.length;
+    console.log(`  ${label}: ${written}/${rows.length} rows`);
   }
-  return `${lines.join("\n")}\n`;
-}
-
-async function publish(context, path, body) {
-  const url = `${context.baseUrl}/api/v1/publish/${context.dataset}/${encodeURI(path)}`;
-  const response = await fetch(url, {
-    method: "PUT",
-    headers: {
-      authorization: `Bearer ${context.writeToken}`,
-      "content-type": "text/csv",
-    },
-    body,
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`publish ${path} failed: HTTP ${response.status} ${detail}`);
-  }
-  const result = await response.json();
-  console.log(
-    `published ${path} (${result.size} bytes, sha256 ${result.sha256.slice(0, 12)}…)`,
-  );
+  return written;
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const startMs = parseDateMs(required(options, "since"), "since");
-  const endMs =
-    options.until === undefined ? Date.now() : parseDateMs(options.until, "until");
+  const endMs = options.until === undefined ? Date.now() : parseDateMs(options.until, "until");
   if (endMs <= startMs) {
     throw new Error("--until must be later than --since");
   }
   const context = {
     baseUrl: (options["base-url"] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     dataset: options.dataset ?? "okx-btc-swap",
+    fundingDataset: options["funding-dataset"] ?? `${options.dataset ?? "okx-btc-swap"}-funding`,
     writeToken: required(options, "write-token"),
     okxBase: options["okx-base"] ?? "https://www.okx.com",
     pace: Number(options["pace-ms"] ?? 150),
+    batch: Number(options.batch ?? 1000),
     dryRun: options["dry-run"] === true,
   };
   const instrument = options.inst ?? "BTC-USDT-SWAP";
   if (!Number.isFinite(context.pace) || context.pace < 0) {
     throw new Error("--pace-ms must be a non-negative number");
   }
+  if (!Number.isInteger(context.batch) || context.batch < 1) {
+    throw new Error("--batch must be a positive integer");
+  }
 
   console.log(`window ${isoMinute(startMs)} → ${isoMinute(endMs)} (UTC)`);
   const candles = await fetchCandles(context, instrument, startMs, endMs);
   const funding = await fetchFunding(context, instrument, startMs, endMs);
-  console.log(
-    `collected ${candles.length} candles and ${funding.length} funding points`,
-  );
+  console.log(`collected ${candles.length} candles and ${funding.length} funding points`);
 
-  let published = 0;
-  const files = [
-    ...groupBy(candles, (row) => isoMinute(Number(row[0])).slice(0, 10)).map(
-      ([day, rows]) => [`klines-1m/${day}.csv`, renderCandles(rows)],
-    ),
-    ...groupBy(funding, (record) => isoMinute(Number(record.fundingTime)).slice(0, 7)).map(
-      ([month, rows]) => [`funding-rate/${month}.csv`, renderFunding(rows)],
-    ),
-  ];
-  for (const [path, body] of files) {
-    if (context.dryRun) {
-      console.log(`dry-run: would publish ${path} (${Buffer.byteLength(body)} bytes)`);
-    } else {
-      await publish(context, path, body);
-      published += 1;
-    }
+  const klines = candles.map((row) => candleRow(instrument, row));
+  const fundingRows = funding.map((record) => fundingRow(instrument, record));
+  if (context.dryRun) {
+    console.log(`dry-run complete: ${klines.length} klines and ${fundingRows.length} funding rows`);
+    return;
   }
+  const writtenKlines = await ingest(context, context.dataset, "klines", klines);
+  const writtenFunding = await ingest(context, context.fundingDataset, "funding", fundingRows);
   console.log(
-    context.dryRun
-      ? `dry-run complete: ${files.length} files`
-      : `done: ${published} files published to ${context.baseUrl}/api/v1/publish/${context.dataset}`,
+    `done: ${writtenKlines} klines into ${context.dataset} and ${writtenFunding} funding rows into ${context.fundingDataset}`,
   );
 }
 

@@ -1,3 +1,10 @@
+//! The control plane: datasets and their declared schemas, the cold catalog,
+//! flush bookkeeping, write tokens, the audit trail, syncers and Linkit state.
+//!
+//! The data itself never lives here. A dataset owns one hot `SQLite` database
+//! (see [`crate::hot`]) and an append-only tree of Parquet objects in the cold
+//! store; this database only remembers what exists.
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -7,21 +14,197 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cooling::{Cadence, CoolingSpec};
 use crate::crypto::{Cipher, CipherError};
+use crate::hot::HotStore;
+use crate::schema::{self, TableSpec};
 
-#[derive(Clone)]
-pub struct Database {
-    connection: Arc<Mutex<Connection>>,
-    cipher: Cipher,
-    database_path: Arc<PathBuf>,
-    datasets_directory: Arc<PathBuf>,
+const SCHEMA_VERSION: &str = "4";
+
+/// One dataset: one declared table, its cooling calendar and a cold catalog.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Dataset {
+    /// Slug identifying the dataset.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Free-form description.
+    pub description: String,
+    /// When the hot window rolls over, in which calendar.
+    pub cooling: CoolingSpec,
+    /// Sequence number of the last committed flush batch.
+    pub last_batch: i64,
+    /// Creation timestamp.
+    pub created_at: i64,
+    /// The one table the dataset declares.
+    pub table: TableSpec,
 }
 
-impl std::fmt::Debug for Database {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Database").finish_non_exhaustive()
-    }
+/// One immutable Parquet file in the cold tree.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ColdFile {
+    /// Owning dataset.
+    pub dataset_id: String,
+    /// Flush batch that produced the file.
+    pub batch: i64,
+    /// Dataset-relative object path, also the local mirror path.
+    pub path: String,
+    /// Partition key (`day=2026-10-01`).
+    pub partition: String,
+    /// Rows in the file.
+    pub rows: i64,
+    /// Object size in bytes.
+    pub bytes: u64,
+    /// SHA-256 of the object.
+    pub sha256: String,
+    /// Oldest timestamp in the file.
+    pub min_time: String,
+    /// Newest timestamp in the file.
+    pub max_time: String,
+    /// When the file became part of the catalog.
+    pub created_at: i64,
 }
+
+/// Cold storage totals of a dataset.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ColdSummary {
+    /// Files catalogued for the dataset.
+    pub files: i64,
+    /// Bytes catalogued for the dataset.
+    pub bytes: u64,
+    /// Oldest timestamp in cold storage.
+    pub earliest_time: Option<String>,
+    /// Newest timestamp in cold storage.
+    pub latest_time: Option<String>,
+}
+
+/// One cooling pass over a dataset.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Flush {
+    /// Flush id.
+    pub id: String,
+    /// Owning dataset.
+    pub dataset_id: String,
+    /// Batch sequence number, shared with the cold files it produced.
+    pub batch: i64,
+    /// What started it: `schedule`, `manual` or `backfill`.
+    pub trigger: String,
+    /// `running`, `completed` or `failed`.
+    pub status: String,
+    /// Files written.
+    pub files: i64,
+    /// Rows written.
+    pub rows: i64,
+    /// Bytes written.
+    pub bytes: i64,
+    /// Failure message, empty on success.
+    pub message: String,
+    /// Start timestamp.
+    pub created_at: i64,
+    /// End timestamp.
+    pub finished_at: Option<i64>,
+}
+
+/// A user's mirror subscription of one dataset.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Syncer {
+    /// Syncer id.
+    pub id: String,
+    /// Owning user.
+    pub owner_id: String,
+    /// Display name.
+    pub name: String,
+    /// Mirrored dataset.
+    pub dataset_id: String,
+    /// Last flush batch this mirror saw.
+    pub last_batch: i64,
+    /// Creation timestamp.
+    pub created_at: i64,
+    /// Last successful mirror timestamp.
+    pub last_synced_at: Option<i64>,
+}
+
+/// Linkit delivery state of one user.
+#[derive(Clone, Debug, Serialize)]
+pub struct LinkitStatus {
+    /// Whether a bot is provisioned.
+    pub configured: bool,
+    /// Provisioned bot id.
+    pub bot_id: Option<String>,
+    /// Linkit username the bot talks to.
+    pub recipient_username: Option<String>,
+    /// Last delivery attempt.
+    pub last_attempt_at: Option<i64>,
+    /// Last successful delivery.
+    pub last_success_at: Option<i64>,
+    /// Last failure.
+    pub last_error: Option<String>,
+}
+
+/// Secret half of the Linkit connection.
+#[derive(Clone, Debug)]
+pub struct SecretLinkitSettings {
+    /// Bot id.
+    pub bot_id: String,
+    /// Decrypted bot token.
+    pub bot_token: String,
+    /// Recipient username.
+    pub username: String,
+}
+
+/// A write token; only its hash is stored.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WriteToken {
+    /// Token id.
+    pub id: String,
+    /// Publisher name, used as the audit attribution.
+    pub name: String,
+    /// Creation timestamp.
+    pub created_at: i64,
+    /// Last use.
+    pub last_used_at: Option<i64>,
+}
+
+/// A freshly created write token, with its one-time plaintext secret.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WriteTokenCreated {
+    /// Token id.
+    pub id: String,
+    /// Publisher name.
+    pub name: String,
+    /// Plaintext secret; shown once.
+    pub secret: String,
+    /// Creation timestamp.
+    pub created_at: i64,
+}
+
+/// One row of the ingest audit trail.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IngestEvent {
+    /// Event id.
+    pub id: String,
+    /// Dataset written to.
+    pub dataset_id: String,
+    /// Rows upserted.
+    pub upserted: i64,
+    /// Rows deleted.
+    pub deleted: i64,
+    /// Token id used.
+    pub token_id: String,
+    /// Token name used, denormalised so revoked tokens stay attributable.
+    pub token_name: String,
+    /// When it happened.
+    pub created_at: i64,
+}
+
+/// Cold storage coordinates.
+pub const META_COLD_BUCKET: &str = "cold_bucket";
+/// Cold storage region key.
+pub const META_COLD_REGION: &str = "cold_region";
+/// Default cold bucket.
+pub const DEFAULT_COLD_BUCKET: &str = "firmament-ntnl";
+/// Default cold region.
+pub const DEFAULT_COLD_REGION: &str = "ap-northeast-1";
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -31,151 +214,96 @@ pub enum DatabaseError {
     Poisoned,
     #[error("secret encryption failed")]
     Cipher(#[from] CipherError),
-    #[error("dataset directory operation failed")]
+    #[error("dataset state failed: {0}")]
     Files(#[source] std::io::Error),
+    #[error("hot storage failed: {0}")]
+    Hot(#[from] crate::hot::HotError),
+    #[error("{0}")]
+    Conflict(String),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Dataset {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub tier: String,
-    pub created_at: i64,
+/// The control-plane database plus the hot store it owns.
+#[derive(Clone)]
+pub struct Database {
+    connection: Arc<Mutex<Connection>>,
+    cipher: Cipher,
+    database_path: Arc<PathBuf>,
+    hot: HotStore,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Syncer {
-    pub id: String,
-    pub owner_id: String,
-    pub name: String,
-    pub dataset_id: String,
-    pub subdir: String,
-    pub created_at: i64,
-    pub last_synced_at: Option<i64>,
+impl std::fmt::Debug for Database {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Database").finish_non_exhaustive()
+    }
 }
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LinkitStatus {
-    pub configured: bool,
-    pub bot_id: Option<String>,
-    pub recipient_username: Option<String>,
-    pub last_attempt_at: Option<i64>,
-    pub last_success_at: Option<i64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SecretLinkitSettings {
-    pub bot_id: String,
-    pub bot_token: String,
-    pub username: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ColdFile {
-    pub dataset_id: String,
-    pub path: String,
-    pub size: u64,
-    pub sha256: String,
-    pub source_path: String,
-    pub archived_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ArchiveJob {
-    pub id: String,
-    pub dataset_id: String,
-    pub status: String,
-    pub total_files: i64,
-    pub archived_files: i64,
-    pub skipped_files: i64,
-    pub failed_files: i64,
-    pub message: String,
-    pub created_at: i64,
-    pub finished_at: Option<i64>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ArchiveCounts {
-    pub total_files: i64,
-    pub archived_files: i64,
-    pub skipped_files: i64,
-    pub failed_files: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WriteToken {
-    pub id: String,
-    pub name: String,
-    pub created_at: i64,
-    pub last_used_at: Option<i64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WriteTokenCreated {
-    pub id: String,
-    pub name: String,
-    pub secret: String,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PublishEvent {
-    pub id: String,
-    pub dataset_id: String,
-    pub path: String,
-    pub size: u64,
-    pub sha256: String,
-    pub token_id: String,
-    pub token_name: String,
-    pub created_at: i64,
-}
-
-const DEMO_DATASET: &str = "demo";
-const DEMO_DESCRIPTION: &str = "示例数据集：一段合成的行情样本，用来体验导出与同步流程。";
-const DEMO_README: &str = include_str!("../samples/demo/README.md");
-const DEMO_MARKET_CSV: &str = include_str!("../samples/demo/market-sample.csv");
-
-pub const META_COLD_BUCKET: &str = "cold_bucket";
-pub const META_COLD_REGION: &str = "cold_region";
-pub const DEFAULT_COLD_BUCKET: &str = "firmament-ntnl";
-pub const DEFAULT_COLD_REGION: &str = "ap-northeast-1";
 
 impl Database {
-    /// Opens Firmament's `SQLite` database and forces WAL mode before serving requests.
+    /// Opens Firmament's state directory: the control-plane database, the hot
+    /// databases and the credential key.
     ///
     /// # Errors
     ///
-    /// Returns an error when the database, schema or secret cipher cannot be initialized.
+    /// Returns an error when the database, its schema, the hot store or the
+    /// secret cipher cannot be initialized.
     pub fn open(state_directory: &Path) -> Result<Self, DatabaseError> {
         let cipher = Cipher::load_or_create(state_directory)?;
         let database_path = state_directory.join("default.sqlite3");
-        let datasets_directory = state_directory.join("datasets");
         let connection = Connection::open(&database_path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )?;
         drop_legacy_linkit_settings(&connection)?;
+        migrate(&connection)?;
         connection.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY NOT NULL,
-                value TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS datasets (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
                 description TEXT NOT NULL,
-                tier TEXT NOT NULL CHECK(tier IN ('hot', 'cold')),
+                spec TEXT NOT NULL,
+                cadence TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                last_batch INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS flushes (
+                id TEXT PRIMARY KEY NOT NULL,
+                dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                batch INTEGER NOT NULL,
+                trigger TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+                files INTEGER NOT NULL DEFAULT 0,
+                rows INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                UNIQUE(dataset_id, batch)
+            );
+            CREATE INDEX IF NOT EXISTS flushes_dataset_id_idx ON flushes(dataset_id, batch DESC);
+            CREATE TABLE IF NOT EXISTS cold_files (
+                dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                batch INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                partition TEXT NOT NULL,
+                rows INTEGER NOT NULL,
+                bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                min_time TEXT NOT NULL,
+                max_time TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (dataset_id, path)
+            );
+            CREATE INDEX IF NOT EXISTS cold_files_batch_idx ON cold_files(dataset_id, batch);
             CREATE TABLE IF NOT EXISTS syncers (
                 id TEXT PRIMARY KEY NOT NULL,
                 owner_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                subdir TEXT NOT NULL DEFAULT '',
+                last_batch INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_synced_at INTEGER
             );
@@ -190,28 +318,6 @@ impl Database {
                 last_error TEXT,
                 updated_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS cold_files (
-                dataset_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                sha256 TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                archived_at INTEGER NOT NULL,
-                PRIMARY KEY (dataset_id, path)
-            );
-            CREATE TABLE IF NOT EXISTS archive_jobs (
-                id TEXT PRIMARY KEY NOT NULL,
-                dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
-                total_files INTEGER NOT NULL DEFAULT 0,
-                archived_files INTEGER NOT NULL DEFAULT 0,
-                skipped_files INTEGER NOT NULL DEFAULT 0,
-                failed_files INTEGER NOT NULL DEFAULT 0,
-                message TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL,
-                finished_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS archive_jobs_dataset_id_idx ON archive_jobs(dataset_id);
             CREATE TABLE IF NOT EXISTS write_tokens (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
@@ -219,49 +325,39 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER
             );
-            CREATE TABLE IF NOT EXISTS publish_events (
+            CREATE TABLE IF NOT EXISTS ingest_events (
                 id TEXT PRIMARY KEY NOT NULL,
                 dataset_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                sha256 TEXT NOT NULL,
+                upserted INTEGER NOT NULL,
+                deleted INTEGER NOT NULL,
                 token_id TEXT NOT NULL,
                 token_name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS publish_events_created_at_idx ON publish_events(created_at);
+            CREATE INDEX IF NOT EXISTS ingest_events_created_at_idx ON ingest_events(created_at);
             ",
         )?;
+        let hot = HotStore::new(state_directory.join("hot"))?;
         let database = Self {
             connection: Arc::new(Mutex::new(connection)),
             cipher,
             database_path: Arc::new(database_path),
-            datasets_directory: Arc::new(datasets_directory),
+            hot,
         };
-        database.seed_demo_dataset()?;
         database.put_meta_if_missing(META_COLD_BUCKET, DEFAULT_COLD_BUCKET)?;
         database.put_meta_if_missing(META_COLD_REGION, DEFAULT_COLD_REGION)?;
+        database.reapply_schemas()?;
         Ok(database)
     }
 
+    /// The control-plane `SQLite` file.
     pub fn database_path(&self) -> PathBuf {
         self.database_path.as_ref().clone()
     }
 
-    pub fn dataset_directory(&self, dataset_id: &str) -> PathBuf {
-        self.datasets_directory.join(dataset_id)
-    }
-
-    fn seed_demo_dataset(&self) -> Result<(), DatabaseError> {
-        let directory = self.dataset_directory(DEMO_DATASET);
-        std::fs::create_dir_all(&directory).map_err(DatabaseError::Files)?;
-        write_if_missing(&directory.join("README.md"), DEMO_README)?;
-        write_if_missing(&directory.join("market-sample.csv"), DEMO_MARKET_CSV)?;
-        self.connection()?.execute(
-            "INSERT INTO datasets(id, name, description, tier, created_at) VALUES (?1, ?2, ?3, 'hot', ?4) ON CONFLICT(id) DO NOTHING",
-            params![DEMO_DATASET, "Demo", DEMO_DESCRIPTION, Utc::now().timestamp()],
-        )?;
-        Ok(())
+    /// The hot store backing every dataset.
+    pub fn hot(&self) -> &HotStore {
+        &self.hot
     }
 
     pub fn root_user_id(&self) -> Result<Option<String>, DatabaseError> {
@@ -283,34 +379,68 @@ impl Database {
         Ok(changed == 1)
     }
 
-    pub fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
-        let connection = self.connection()?;
-        let mut statement = connection
-            .prepare("SELECT id, name, description, tier, created_at FROM datasets ORDER BY id")?;
-        statement
-            .query_map([], dataset_from_row)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DatabaseError::Sqlite)
-    }
-
-    /// Creates a dataset id; returns `false` when the id already exists.
+    /// Creates a dataset and its hot database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema is invalid, the id is taken or the hot
+    /// database cannot be created. A half-created dataset is rolled back.
     pub fn create_dataset(
         &self,
         id: &str,
         name: &str,
         description: &str,
-    ) -> Result<bool, DatabaseError> {
-        let changed = self.connection()?.execute(
-            "INSERT INTO datasets(id, name, description, tier, created_at) VALUES (?1, ?2, ?3, 'hot', ?4) ON CONFLICT(id) DO NOTHING",
-            params![id, name, description, Utc::now().timestamp()],
+        cooling: &CoolingSpec,
+        table: &TableSpec,
+    ) -> Result<Dataset, DatabaseError> {
+        schema::validate(table).map_err(DatabaseError::Conflict)?;
+        let spec = serde_json::to_string(table).map_err(|error| {
+            DatabaseError::Files(std::io::Error::other(format!(
+                "schema encoding failed: {error}"
+            )))
+        })?;
+        let created_at = Utc::now().timestamp();
+        let inserted = self.connection()?.execute(
+            "INSERT INTO datasets(id, name, description, spec, cadence, timezone, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7) ON CONFLICT(id) DO NOTHING",
+            params![id, name, description, spec, cooling.cadence.as_str(), cooling.timezone, created_at],
         )?;
-        Ok(changed == 1)
+        if inserted == 0 {
+            return Err(DatabaseError::Conflict(format!(
+                "dataset {id} already exists"
+            )));
+        }
+        if let Err(error) = self.hot.create(id, table) {
+            let _ = self
+                .connection()?
+                .execute("DELETE FROM datasets WHERE id = ?1", [id]);
+            return Err(DatabaseError::Hot(error));
+        }
+        Ok(Dataset {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            cooling: cooling.clone(),
+            last_batch: 0,
+            created_at,
+            table: table.clone(),
+        })
+    }
+
+    pub fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
+        )?;
+        let datasets = statement
+            .query_map([], dataset_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(datasets)
     }
 
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, name, description, tier, created_at FROM datasets WHERE id = ?1",
+                "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets WHERE id = ?1",
                 [id],
                 dataset_from_row,
             )
@@ -318,9 +448,177 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    /// Starts a cooling pass, allocating the next batch number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another pass on the same dataset is still running.
+    pub fn begin_flush(&self, dataset_id: &str, trigger: &str) -> Result<Flush, DatabaseError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let running: Option<i64> = transaction
+            .query_row(
+                "SELECT batch FROM flushes WHERE dataset_id = ?1 AND status = 'running' LIMIT 1",
+                [dataset_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(batch) = running {
+            return Err(DatabaseError::Conflict(format!(
+                "batch {batch} is still running"
+            )));
+        }
+        transaction.execute(
+            "UPDATE datasets SET last_batch = last_batch + 1 WHERE id = ?1",
+            [dataset_id],
+        )?;
+        let batch: i64 = transaction.query_row(
+            "SELECT last_batch FROM datasets WHERE id = ?1",
+            [dataset_id],
+            |row| row.get(0),
+        )?;
+        let flush = Flush {
+            id: Uuid::new_v4().to_string(),
+            dataset_id: dataset_id.to_owned(),
+            batch,
+            trigger: trigger.to_owned(),
+            status: "running".to_owned(),
+            files: 0,
+            rows: 0,
+            bytes: 0,
+            message: String::new(),
+            created_at: Utc::now().timestamp(),
+            finished_at: None,
+        };
+        transaction.execute(
+            "INSERT INTO flushes(id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at) VALUES (?1, ?2, ?3, ?4, 'running', 0, 0, 0, '', ?5)",
+            params![flush.id, flush.dataset_id, flush.batch, flush.trigger, flush.created_at],
+        )?;
+        transaction.commit()?;
+        Ok(flush)
+    }
+
+    /// Records the files of a finished batch; this is the commit point of a
+    /// cooling pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog rows cannot be written.
+    pub fn record_batch(
+        &self,
+        dataset_id: &str,
+        batch: i64,
+        files: &[ColdFile],
+    ) -> Result<(), DatabaseError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for file in files {
+            transaction.execute(
+                "INSERT INTO cold_files(dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(dataset_id, path) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes, sha256 = excluded.sha256, min_time = excluded.min_time, max_time = excluded.max_time",
+                params![
+                    dataset_id,
+                    batch,
+                    file.path,
+                    file.partition,
+                    file.rows,
+                    file.bytes as i64,
+                    file.sha256,
+                    file.min_time,
+                    file.max_time,
+                    file.created_at
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Finishes a cooling pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be updated.
+    pub fn finish_flush(
+        &self,
+        id: &str,
+        status: &str,
+        files: i64,
+        rows: i64,
+        bytes: i64,
+        message: &str,
+    ) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "UPDATE flushes SET status = ?2, files = ?3, rows = ?4, bytes = ?5, message = ?6, finished_at = ?7 WHERE id = ?1",
+            params![id, status, files, rows, bytes, message, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_flush(&self, dataset_id: &str) -> Result<Option<Flush>, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY batch DESC LIMIT 1",
+                [dataset_id],
+                flush_from_row,
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    pub fn list_flushes(&self, dataset_id: &str, limit: i64) -> Result<Vec<Flush>, DatabaseError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY batch DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![dataset_id, limit], flush_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Lists cold files, optionally only those newer than a mirrored batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be read.
+    pub fn cold_files(
+        &self,
+        dataset_id: &str,
+        since_batch: i64,
+    ) -> Result<Vec<ColdFile>, DatabaseError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND batch > ?2 ORDER BY batch ASC, path ASC",
+        )?;
+        statement
+            .query_map(params![dataset_id, since_batch], cold_file_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Looks up one catalogued cold file; anything else is not downloadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be read.
+    pub fn cold_file(
+        &self,
+        dataset_id: &str,
+        path: &str,
+    ) -> Result<Option<ColdFile>, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
+                params![dataset_id, path],
+                cold_file_from_row,
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
     pub fn list_syncers(&self, owner_id: Option<&str>) -> Result<Vec<Syncer>, DatabaseError> {
         let connection = self.connection()?;
-        let columns = "SELECT id, owner_id, name, dataset_id, subdir, created_at, last_synced_at FROM syncers";
+        let columns = "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers";
         match owner_id {
             Some(owner_id) => {
                 let mut statement = connection.prepare(&format!(
@@ -345,7 +643,7 @@ impl Database {
     pub fn get_syncer(&self, id: &str) -> Result<Option<Syncer>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, owner_id, name, dataset_id, subdir, created_at, last_synced_at FROM syncers WHERE id = ?1",
+                "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers WHERE id = ?1",
                 [id],
                 syncer_from_row,
             )
@@ -358,20 +656,19 @@ impl Database {
         owner_id: &str,
         name: &str,
         dataset_id: &str,
-        subdir: &str,
     ) -> Result<Syncer, DatabaseError> {
         let syncer = Syncer {
             id: Uuid::new_v4().to_string(),
             owner_id: owner_id.to_owned(),
             name: name.to_owned(),
             dataset_id: dataset_id.to_owned(),
-            subdir: subdir.to_owned(),
+            last_batch: 0,
             created_at: Utc::now().timestamp(),
             last_synced_at: None,
         };
         self.connection()?.execute(
-            "INSERT INTO syncers(id, owner_id, name, dataset_id, subdir, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.subdir, syncer.created_at],
+            "INSERT INTO syncers(id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.last_batch, syncer.created_at],
         )?;
         Ok(syncer)
     }
@@ -383,14 +680,20 @@ impl Database {
         Ok(changed == 1)
     }
 
+    /// Records a mirrored batch on a syncer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be updated.
     pub fn mark_syncer_synced(
         &self,
         id: &str,
         timestamp: i64,
+        batch: i64,
     ) -> Result<Option<Syncer>, DatabaseError> {
         self.connection()?.execute(
-            "UPDATE syncers SET last_synced_at = ?2 WHERE id = ?1",
-            params![id, timestamp],
+            "UPDATE syncers SET last_synced_at = ?2, last_batch = MAX(last_batch, ?3) WHERE id = ?1",
+            params![id, timestamp, batch],
         )?;
         self.get_syncer(id)
     }
@@ -500,130 +803,6 @@ impl Database {
         Ok(())
     }
 
-    fn put_meta_if_missing(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
-        self.connection()?.execute(
-            "INSERT INTO app_meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_cold_files(&self, dataset_id: &str) -> Result<Vec<ColdFile>, DatabaseError> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT dataset_id, path, size, sha256, source_path, archived_at FROM cold_files WHERE dataset_id = ?1 ORDER BY path",
-        )?;
-        statement
-            .query_map([dataset_id], cold_file_from_row)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DatabaseError::Sqlite)
-    }
-
-    pub fn cold_file(
-        &self,
-        dataset_id: &str,
-        path: &str,
-    ) -> Result<Option<ColdFile>, DatabaseError> {
-        self.connection()?
-            .query_row(
-                "SELECT dataset_id, path, size, sha256, source_path, archived_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
-                params![dataset_id, path],
-                cold_file_from_row,
-            )
-            .optional()
-            .map_err(DatabaseError::Sqlite)
-    }
-
-    pub fn upsert_cold_file(
-        &self,
-        dataset_id: &str,
-        path: &str,
-        size: u64,
-        sha256: &str,
-        source_path: &str,
-        archived_at: i64,
-    ) -> Result<(), DatabaseError> {
-        self.connection()?.execute(
-            "INSERT INTO cold_files(dataset_id, path, size, sha256, source_path, archived_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(dataset_id, path) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, source_path = excluded.source_path, archived_at = excluded.archived_at",
-            params![dataset_id, path, size as i64, sha256, source_path, archived_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn create_archive_job_if_idle(
-        &self,
-        dataset_id: &str,
-    ) -> Result<Option<ArchiveJob>, DatabaseError> {
-        let connection = self.connection()?;
-        let running: Option<String> = connection
-            .query_row(
-                "SELECT id FROM archive_jobs WHERE dataset_id = ?1 AND status = 'running' LIMIT 1",
-                [dataset_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if running.is_some() {
-            return Ok(None);
-        }
-        let job = ArchiveJob {
-            id: Uuid::new_v4().to_string(),
-            dataset_id: dataset_id.to_owned(),
-            status: "running".to_owned(),
-            total_files: 0,
-            archived_files: 0,
-            skipped_files: 0,
-            failed_files: 0,
-            message: String::new(),
-            created_at: Utc::now().timestamp(),
-            finished_at: None,
-        };
-        connection.execute(
-            "INSERT INTO archive_jobs(id, dataset_id, status, total_files, archived_files, skipped_files, failed_files, message, created_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-            params![job.id, job.dataset_id, job.status, job.total_files, job.archived_files, job.skipped_files, job.failed_files, job.message, job.created_at],
-        )?;
-        Ok(Some(job))
-    }
-
-    pub fn update_archive_job_progress(
-        &self,
-        id: &str,
-        counts: ArchiveCounts,
-    ) -> Result<(), DatabaseError> {
-        self.connection()?.execute(
-            "UPDATE archive_jobs SET total_files = ?2, archived_files = ?3, skipped_files = ?4, failed_files = ?5 WHERE id = ?1",
-            params![id, counts.total_files, counts.archived_files, counts.skipped_files, counts.failed_files],
-        )?;
-        Ok(())
-    }
-
-    pub fn finish_archive_job(
-        &self,
-        id: &str,
-        status: &str,
-        counts: ArchiveCounts,
-        message: &str,
-    ) -> Result<(), DatabaseError> {
-        self.connection()?.execute(
-            "UPDATE archive_jobs SET status = ?2, total_files = ?3, archived_files = ?4, skipped_files = ?5, failed_files = ?6, message = ?7, finished_at = ?8 WHERE id = ?1",
-            params![id, status, counts.total_files, counts.archived_files, counts.skipped_files, counts.failed_files, message, Utc::now().timestamp()],
-        )?;
-        Ok(())
-    }
-
-    pub fn latest_archive_job(
-        &self,
-        dataset_id: &str,
-    ) -> Result<Option<ArchiveJob>, DatabaseError> {
-        self.connection()?
-            .query_row(
-                "SELECT id, dataset_id, status, total_files, archived_files, skipped_files, failed_files, message, created_at, finished_at FROM archive_jobs WHERE dataset_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                [dataset_id],
-                archive_job_from_row,
-            )
-            .optional()
-            .map_err(DatabaseError::Sqlite)
-    }
-
     pub fn create_write_token(
         &self,
         name: &str,
@@ -682,33 +861,73 @@ impl Database {
         Ok(changed == 1)
     }
 
-    /// Records one publish in the audit trail; the token name is denormalized so
+    /// Records one ingest in the audit trail; the token name is denormalized so
     /// revoked tokens keep their attribution.
-    pub fn record_publish_event(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be written.
+    pub fn record_ingest_event(
         &self,
         dataset_id: &str,
-        path: &str,
-        size: u64,
-        sha256: &str,
+        upserted: i64,
+        deleted: i64,
         token_id: &str,
         token_name: &str,
     ) -> Result<(), DatabaseError> {
         self.connection()?.execute(
-            "INSERT INTO publish_events(id, dataset_id, path, size, sha256, token_id, token_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![Uuid::new_v4().to_string(), dataset_id, path, size as i64, sha256, token_id, token_name, Utc::now().timestamp()],
+            "INSERT INTO ingest_events(id, dataset_id, upserted, deleted, token_id, token_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![Uuid::new_v4().to_string(), dataset_id, upserted, deleted, token_id, token_name, Utc::now().timestamp()],
         )?;
         Ok(())
     }
 
-    pub fn list_publish_events(&self, limit: i64) -> Result<Vec<PublishEvent>, DatabaseError> {
+    pub fn list_ingest_events(&self, limit: i64) -> Result<Vec<IngestEvent>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, dataset_id, path, size, sha256, token_id, token_name, created_at FROM publish_events ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+            "SELECT id, dataset_id, upserted, deleted, token_id, token_name, created_at FROM ingest_events ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         statement
-            .query_map([limit], publish_event_from_row)?
+            .query_map([limit], ingest_event_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Summarises the cold tree of a dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be read.
+    pub fn cold_summary(&self, dataset_id: &str) -> Result<ColdSummary, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MIN(min_time), MAX(max_time) FROM cold_files WHERE dataset_id = ?1",
+                [dataset_id],
+                |row| {
+                    Ok(ColdSummary {
+                        files: row.get(0)?,
+                        bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                        earliest_time: row.get(2)?,
+                        latest_time: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    fn reapply_schemas(&self) -> Result<(), DatabaseError> {
+        for dataset in self.list_datasets()? {
+            self.hot.apply_schema(&dataset.id, &dataset.table)?;
+        }
+        Ok(())
+    }
+
+    fn put_meta_if_missing(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "INSERT INTO app_meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, DatabaseError> {
@@ -717,12 +936,32 @@ impl Database {
 }
 
 fn dataset_from_row(row: &Row<'_>) -> rusqlite::Result<Dataset> {
+    let spec: String = row.get(3)?;
+    let table = serde_json::from_str(&spec).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error.to_string())),
+        )
+    })?;
+    let cadence: String = row.get(4)?;
     Ok(Dataset {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
-        tier: row.get(3)?,
-        created_at: row.get(4)?,
+        table,
+        cooling: CoolingSpec {
+            cadence: Cadence::parse(&cadence).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(format!("unknown cadence {cadence}"))),
+                )
+            })?,
+            timezone: row.get(5)?,
+        },
+        last_batch: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -732,7 +971,7 @@ fn syncer_from_row(row: &Row<'_>) -> rusqlite::Result<Syncer> {
         owner_id: row.get(1)?,
         name: row.get(2)?,
         dataset_id: row.get(3)?,
-        subdir: row.get(4)?,
+        last_batch: row.get(4)?,
         created_at: row.get(5)?,
         last_synced_at: row.get(6)?,
     })
@@ -747,50 +986,75 @@ fn write_token_from_row(row: &Row<'_>) -> rusqlite::Result<WriteToken> {
     })
 }
 
-fn publish_event_from_row(row: &Row<'_>) -> rusqlite::Result<PublishEvent> {
-    Ok(PublishEvent {
+fn ingest_event_from_row(row: &Row<'_>) -> rusqlite::Result<IngestEvent> {
+    Ok(IngestEvent {
         id: row.get(0)?,
         dataset_id: row.get(1)?,
-        path: row.get(2)?,
-        size: row.get::<_, i64>(3)?.max(0) as u64,
-        sha256: row.get(4)?,
-        token_id: row.get(5)?,
-        token_name: row.get(6)?,
-        created_at: row.get(7)?,
+        upserted: row.get(2)?,
+        deleted: row.get(3)?,
+        token_id: row.get(4)?,
+        token_name: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn flush_from_row(row: &Row<'_>) -> rusqlite::Result<Flush> {
+    Ok(Flush {
+        id: row.get(0)?,
+        dataset_id: row.get(1)?,
+        batch: row.get(2)?,
+        trigger: row.get(3)?,
+        status: row.get(4)?,
+        files: row.get(5)?,
+        rows: row.get(6)?,
+        bytes: row.get(7)?,
+        message: row.get(8)?,
+        created_at: row.get(9)?,
+        finished_at: row.get(10)?,
     })
 }
 
 fn cold_file_from_row(row: &Row<'_>) -> rusqlite::Result<ColdFile> {
     Ok(ColdFile {
         dataset_id: row.get(0)?,
-        path: row.get(1)?,
-        size: row.get::<_, i64>(2)?.max(0) as u64,
-        sha256: row.get(3)?,
-        source_path: row.get(4)?,
-        archived_at: row.get(5)?,
+        batch: row.get(1)?,
+        path: row.get(2)?,
+        partition: row.get(3)?,
+        rows: row.get(4)?,
+        bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        sha256: row.get(6)?,
+        min_time: row.get(7)?,
+        max_time: row.get(8)?,
+        created_at: row.get(9)?,
     })
 }
 
-fn archive_job_from_row(row: &Row<'_>) -> rusqlite::Result<ArchiveJob> {
-    Ok(ArchiveJob {
-        id: row.get(0)?,
-        dataset_id: row.get(1)?,
-        status: row.get(2)?,
-        total_files: row.get(3)?,
-        archived_files: row.get(4)?,
-        skipped_files: row.get(5)?,
-        failed_files: row.get(6)?,
-        message: row.get(7)?,
-        created_at: row.get(8)?,
-        finished_at: row.get(9)?,
-    })
-}
-
-fn write_if_missing(path: &Path, contents: &str) -> Result<(), DatabaseError> {
-    if path.exists() {
-        return Ok(());
+// The data model changed shape with the hot/cold rewrite: a dataset used to be
+// a directory of arbitrary files and is now a declared schema. Datasets,
+// syncers and the old cold catalog are dropped rather than migrated; tokens and
+// the Linkit connection survive because their meaning did not change.
+fn migrate(connection: &Connection) -> rusqlite::Result<()> {
+    let version: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if version.as_deref() != Some(SCHEMA_VERSION) {
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS archive_jobs;
+             DROP TABLE IF EXISTS publish_events;
+             DROP TABLE IF EXISTS cold_files;
+             DROP TABLE IF EXISTS syncers;
+             DROP TABLE IF EXISTS datasets;",
+        )?;
+        connection.execute(
+            "INSERT INTO app_meta(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION],
+        )?;
     }
-    std::fs::write(path, contents).map_err(DatabaseError::Files)
+    Ok(())
 }
 
 // The pre-ensure table stored a manually configured Bot. The connection is now
@@ -813,198 +1077,157 @@ mod tests {
     use tempfile::TempDir;
 
     use super::Database;
+    use crate::cooling::{Cadence, CoolingSpec};
+    use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
-    #[test]
-    fn seeds_demo_dataset_and_initializes_root_user() {
-        let state = TempDir::new().expect("state directory");
-        let database = Database::open(state.path()).expect("database opens");
+    fn daily() -> CoolingSpec {
+        CoolingSpec {
+            cadence: Cadence::Daily,
+            timezone: "Asia/Shanghai".to_owned(),
+        }
+    }
 
-        let datasets = database.list_datasets().expect("datasets list");
-        assert!(datasets.iter().any(|dataset| dataset.id == "demo"));
-        assert!(
-            database
-                .dataset_directory("demo")
-                .join("market-sample.csv")
-                .exists()
-        );
+    fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
+        ColumnSpec {
+            name: name.to_owned(),
+            column_type,
+            nullable: false,
+        }
+    }
 
-        assert!(database.root_user_id().expect("root user").is_none());
-        database
-            .initialize_root_user("user-1")
-            .expect("root user initializes");
-        assert_eq!(
-            database.root_user_id().expect("root user").as_deref(),
-            Some("user-1")
-        );
+    fn bars() -> TableSpec {
+        TableSpec {
+            primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
+            time_column: "updated_at".to_owned(),
+            granularity: Granularity::Day,
+            columns: vec![
+                column("symbol", ColumnType::Text),
+                column("updated_at", ColumnType::Timestamp),
+                column("close", ColumnType::Real),
+            ],
+        }
     }
 
     #[test]
-    fn syncers_round_trip() {
+    fn datasets_carry_their_declared_schema() {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
+        assert!(database.list_datasets().expect("list").is_empty());
 
-        let syncer = database
-            .create_syncer("user-1", "research", "demo", "data/")
-            .expect("syncer creates");
-        assert_eq!(
-            database.list_syncers(Some("user-1")).expect("list").len(),
-            1
+        let dataset = database
+            .create_dataset("bars", "Bars", "test", &daily(), &bars())
+            .expect("dataset creates");
+        assert_eq!(dataset.cooling.timezone, "Asia/Shanghai");
+        assert_eq!(dataset.last_batch, 0);
+        assert!(
+            database
+                .create_dataset("bars", "Bars", "test", &daily(), &bars())
+                .is_err(),
+            "ids are unique"
         );
-        assert!(database.get_syncer(&syncer.id).expect("get").is_some());
-        let marked = database
-            .mark_syncer_synced(&syncer.id, 42)
-            .expect("mark synced")
-            .expect("syncer exists");
-        assert_eq!(marked.last_synced_at, Some(42));
-        assert!(database.delete_syncer(&syncer.id).expect("delete"));
+
+        let stored = database.dataset("bars").expect("read").expect("exists");
+        assert_eq!(stored.table.granularity, Granularity::Day);
     }
 
     #[test]
-    fn datasets_writes_and_publish_audit_round_trip() {
+    fn batch_numbers_are_allocated_per_dataset_and_serialized() {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
-
-        assert!(
-            database
-                .create_dataset("okx-btc-swap", "OKX BTC 合约", "测试数据集")
-                .expect("dataset creates")
-        );
-        assert!(
-            !database
-                .create_dataset("okx-btc-swap", "OKX BTC 合约", "重复")
-                .expect("duplicate checks")
-        );
-        assert_eq!(
-            database
-                .dataset("okx-btc-swap")
-                .expect("dataset reads")
-                .expect("exists")
-                .tier,
-            "hot"
-        );
-
-        let token = database
-            .create_write_token("okx-publisher", "hash-1")
-            .expect("token creates");
-        assert!(token.last_used_at.is_none());
-        let found = database
-            .write_token_by_secret_hash("hash-1")
-            .expect("token lookup")
-            .expect("token exists");
-        assert_eq!(found.id, token.id);
-        assert!(
-            database
-                .write_token_by_secret_hash("hash-2")
-                .expect("miss lookup")
-                .is_none()
-        );
-
         database
-            .record_publish_event(
-                "okx-btc-swap",
-                "klines-1m/2026-09-03.csv",
-                120,
-                "abc",
-                &token.id,
-                &token.name,
-            )
-            .expect("publish records");
-        database
-            .touch_write_token(&token.id, 42)
-            .expect("token touches");
-        let listed = database.list_write_tokens().expect("tokens list");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].last_used_at, Some(42));
-        let events = database.list_publish_events(10).expect("events list");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].path, "klines-1m/2026-09-03.csv");
-        assert_eq!(events[0].size, 120);
-        assert_eq!(events[0].token_name, "okx-publisher");
+            .create_dataset("bars", "Bars", "", &daily(), &bars())
+            .expect("dataset creates");
 
+        let first = database.begin_flush("bars", "schedule").expect("first");
+        assert_eq!(first.batch, 1);
         assert!(
-            database
-                .delete_write_token(&token.id)
-                .expect("token deletes")
-        );
-        assert!(
-            !database
-                .delete_write_token(&token.id)
-                .expect("repeat delete")
-        );
-        assert!(database.list_write_tokens().expect("list").is_empty());
-    }
-
-    #[test]
-    fn cold_files_and_archive_jobs_round_trip() {
-        let state = TempDir::new().expect("state directory");
-        let database = Database::open(state.path()).expect("database opens");
-
-        assert_eq!(
-            database
-                .meta_value(super::META_COLD_BUCKET)
-                .expect("meta")
-                .as_deref(),
-            Some(super::DEFAULT_COLD_BUCKET)
-        );
-
-        database
-            .upsert_cold_file(
-                "demo",
-                "market-sample.parquet",
-                128,
-                "abc",
-                "market-sample.csv",
-                7,
-            )
-            .expect("cold file upserts");
-        let cold = database
-            .cold_file("demo", "market-sample.parquet")
-            .expect("cold file")
-            .expect("exists");
-        assert_eq!(cold.size, 128);
-        assert_eq!(database.list_cold_files("demo").expect("list").len(), 1);
-
-        let job = database
-            .create_archive_job_if_idle("demo")
-            .expect("job creates")
-            .expect("idle");
-        assert!(
-            database
-                .create_archive_job_if_idle("demo")
-                .expect("job checks")
-                .is_none(),
-            "a running job blocks new ones"
+            database.begin_flush("bars", "manual").is_err(),
+            "one running pass per dataset"
         );
         database
-            .update_archive_job_progress(
-                &job.id,
-                super::ArchiveCounts {
-                    total_files: 2,
-                    archived_files: 1,
-                    ..super::ArchiveCounts::default()
-                },
-            )
-            .expect("progress");
-        database
-            .finish_archive_job(
-                &job.id,
-                "completed",
-                super::ArchiveCounts {
-                    total_files: 2,
-                    archived_files: 1,
-                    skipped_files: 1,
-                    failed_files: 0,
-                },
-                "",
-            )
+            .finish_flush(&first.id, "completed", 1, 10, 100, "")
             .expect("finish");
-        let latest = database
-            .latest_archive_job("demo")
-            .expect("latest")
-            .expect("exists");
-        assert_eq!(latest.status, "completed");
-        assert_eq!(latest.archived_files, 1);
-        assert!(latest.finished_at.is_some());
+        let second = database.begin_flush("bars", "manual").expect("second");
+        assert_eq!(second.batch, 2);
+
+        let flushes = database.list_flushes("bars", 10).expect("list");
+        assert_eq!(flushes.len(), 2);
+        assert_eq!(flushes[0].batch, 2);
+        assert_eq!(flushes[0].status, "running");
+        database
+            .finish_flush(&second.id, "failed", 0, 0, 0, "boom")
+            .expect("fail");
+        assert_eq!(
+            database
+                .latest_flush("bars")
+                .expect("latest")
+                .expect("exists")
+                .status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn catalogue_supports_incremental_reads() {
+        let state = TempDir::new().expect("state directory");
+        let database = Database::open(state.path()).expect("database opens");
+        database
+            .create_dataset("bars", "Bars", "", &daily(), &bars())
+            .expect("dataset creates");
+        let file = super::ColdFile {
+            dataset_id: "bars".to_owned(),
+            batch: 1,
+            path: "day=2026-10-01/000001-0000.parquet".to_owned(),
+            partition: "day=2026-10-01".to_owned(),
+            rows: 3,
+            bytes: 42,
+            sha256: "abc".to_owned(),
+            min_time: "2026-10-01T00:00:00.000000Z".to_owned(),
+            max_time: "2026-10-01T00:02:00.000000Z".to_owned(),
+            created_at: 1,
+        };
+        database
+            .record_batch("bars", 1, std::slice::from_ref(&file))
+            .expect("records");
+
+        assert_eq!(database.cold_files("bars", 0).expect("all").len(), 1);
+        assert!(
+            database
+                .cold_files("bars", 1)
+                .expect("incremental")
+                .is_empty(),
+            "since is exclusive"
+        );
+        assert_eq!(
+            database
+                .cold_file("bars", "day=2026-10-01/000001-0000.parquet")
+                .expect("lookup")
+                .expect("exists")
+                .rows,
+            3
+        );
+        assert!(
+            database
+                .cold_file("bars", "nope.parquet")
+                .expect("lookup")
+                .is_none(),
+            "only catalogued paths resolve"
+        );
+    }
+
+    #[test]
+    fn invalid_schemas_are_rejected_before_the_hot_database_exists() {
+        let state = TempDir::new().expect("state directory");
+        let database = Database::open(state.path()).expect("database opens");
+        let mut broken = bars();
+        broken.primary_key.clear();
+        assert!(
+            database
+                .create_dataset("bars", "Bars", "", &daily(), &broken)
+                .is_err()
+        );
+        assert!(database.list_datasets().expect("list").is_empty());
+        assert!(!state.path().join("hot/bars.sqlite3").exists());
     }
 
     #[test]

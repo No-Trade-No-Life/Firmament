@@ -4,30 +4,89 @@ export type Me = {
   setup_required: boolean
 }
 
-export type Dataset = {
+export type ColumnType = "integer" | "real" | "text" | "boolean" | "timestamp"
+
+export type CoolingCadence = "daily" | "weekly" | "monthly"
+
+export type CoolingSpec = {
+  cadence: CoolingCadence
+  timezone: string
+}
+
+export type Granularity = "hour" | "day" | "month"
+
+export type ColumnSpec = {
+  name: string
+  type: ColumnType
+  nullable?: boolean
+}
+
+export type TableSpec = {
+  primary_key: string[]
+  time_column: string
+  granularity: Granularity
+  columns: ColumnSpec[]
+}
+
+export type TableView = TableSpec & {
+  rows: number
+  coolable_rows: number
+  oldest_time: string | null
+  newest_time: string | null
+  cold_files: number
+  cold_bytes: number
+  cold_from: string | null
+  cold_until: string | null
+}
+
+export type DatasetView = {
   id: string
   name: string
   description: string
-  tier: "hot" | "cold"
-  file_count: number
-  bytes: number
-  cold_file_count: number
-  cold_bytes: number
-  updated_at: number
+  cooling: CoolingSpec
+  last_batch: number
+  created_at: number
+  table: TableView
 }
 
-export type DatasetManifestFile = {
-  path: string
-  size: number
-  sha256: string
-  updated_at: number
-  tier: "hot" | "cold"
-}
-
-export type DatasetManifest = {
+export type ColdFile = {
   dataset_id: string
-  generated_at: number
-  files: DatasetManifestFile[]
+  batch: number
+  path: string
+  partition: string
+  rows: number
+  bytes: number
+  sha256: string
+  min_time: string
+  max_time: string
+  created_at: number
+}
+
+export type Manifest = {
+  dataset_id: string
+  latest_batch: number
+  files: ColdFile[]
+}
+
+export type Flush = {
+  id: string
+  dataset_id: string
+  batch: number
+  trigger: string
+  status: "running" | "completed" | "failed"
+  files: number
+  rows: number
+  bytes: number
+  message: string
+  created_at: number
+  finished_at: number | null
+}
+
+export type FlushResult = {
+  batch: number
+  files: number
+  rows: number
+  bytes: number
 }
 
 export type Syncer = {
@@ -35,7 +94,7 @@ export type Syncer = {
   owner_id: string
   name: string
   dataset_id: string
-  subdir: string
+  last_batch: number
   created_at: number
   last_synced_at: number | null
 }
@@ -47,19 +106,6 @@ export type LinkitStatus = {
   last_attempt_at: number | null
   last_success_at: number | null
   last_error: string | null
-}
-
-export type ArchiveJob = {
-  id: string
-  dataset_id: string
-  status: "running" | "completed" | "failed"
-  total_files: number
-  archived_files: number
-  skipped_files: number
-  failed_files: number
-  message: string
-  created_at: number
-  finished_at: number | null
 }
 
 export type ColdSettings = {
@@ -78,15 +124,20 @@ export type WriteTokenCreated = WriteToken & {
   secret: string
 }
 
-export type PublishEvent = {
+export type IngestEvent = {
   id: string
   dataset_id: string
-  path: string
-  size: number
-  sha256: string
+  upserted: number
+  deleted: number
   token_id: string
   token_name: string
   created_at: number
+}
+
+export type RowsResponse = {
+  dataset_id: string
+  cooling: CoolingSpec
+  rows: Record<string, unknown>[]
 }
 
 export type SystemResources = {

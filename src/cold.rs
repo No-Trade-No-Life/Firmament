@@ -1,6 +1,20 @@
-use std::io::Cursor;
+//! The cold side: an append-only Parquet tree in object storage.
+//!
+//! Objects are written once and never rewritten. That is what makes an
+//! incremental mirror trivially correct: a mirror only ever adds files, and a
+//! file it already has can never become stale.
+//!
+//! Besides the data itself, every batch writes a small immutable catalogue
+//! object next to it, so the cold tree stays readable even if this application
+//! is gone.
+
 use std::sync::Arc;
 
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
@@ -13,6 +27,7 @@ use crate::db::{
     DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, META_COLD_BUCKET,
     META_COLD_REGION,
 };
+use crate::schema::{ColumnType, TableSpec, Value};
 
 #[derive(Debug, Error)]
 pub enum ColdError {
@@ -20,14 +35,13 @@ pub enum ColdError {
     Database(#[from] DatabaseError),
     #[error("cold storage request failed: {0}")]
     S3(String),
-    #[error("file conversion failed: {0}")]
-    Conversion(String),
+    #[error("Parquet encoding failed: {0}")]
+    Parquet(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct ColdObjectMetadata {
     pub sha256: String,
-    pub source: String,
 }
 
 #[derive(Debug)]
@@ -42,7 +56,7 @@ pub struct ColdObjectBody {
     pub size: u64,
 }
 
-/// The blob layer behind the cold catalog: S3 in production, fakes in tests.
+/// The blob layer behind the cold catalogue: S3 in production, fakes in tests.
 #[async_trait]
 pub trait ColdStore: Send + Sync {
     async fn put_object(
@@ -122,7 +136,6 @@ impl ColdStore for S3ColdStore {
             .key(key)
             .body(ByteStream::from(bytes))
             .metadata("sha256", &metadata.sha256)
-            .metadata("source", &metadata.source)
             .send()
             .await
             .map_err(sdk_message)?;
@@ -172,153 +185,182 @@ impl ColdStore for S3ColdStore {
     }
 }
 
-/// Maps a dataset-relative path to the Parquet object path used in the cold store.
-pub fn parquet_path_for(relative: &str) -> Option<String> {
-    let lower = relative.to_ascii_lowercase();
-    if lower.ends_with(".csv") {
-        Some(format!("{}.parquet", &relative[..relative.len() - 4]))
-    } else if lower.ends_with(".parquet") {
-        Some(relative.to_owned())
-    } else {
-        None
-    }
-}
-
+/// The object key of one cold data file.
 pub fn object_key(dataset_id: &str, path: &str) -> String {
     format!("datasets/{dataset_id}/{path}")
 }
 
-/// Converts CSV bytes into a columnar Parquet file (Snappy compressed).
+/// The object key of the catalogue record of one batch.
+pub fn catalog_key(dataset_id: &str, batch: i64) -> String {
+    format!("datasets/{dataset_id}/_catalog/{batch:06}.json")
+}
+
+/// Encodes rows of one table into a Snappy Parquet file.
 ///
 /// # Errors
 ///
-/// Returns an error when the CSV cannot be parsed or the Parquet writer fails.
-pub fn convert_csv_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, ColdError> {
-    let format = arrow::csv::reader::Format::default().with_header(true);
-    let (schema, _) = format
-        .infer_schema(Cursor::new(bytes), Some(100))
-        .map_err(|error| ColdError::Conversion(error.to_string()))?;
-    let schema = Arc::new(schema);
-    let reader = arrow::csv::ReaderBuilder::new(schema.clone())
-        .with_format(format)
-        .build(Cursor::new(bytes))
-        .map_err(|error| ColdError::Conversion(error.to_string()))?;
+/// Returns an error when a value does not match its declared type or the
+/// Parquet writer fails.
+pub fn rows_to_parquet(table: &TableSpec, rows: &[Vec<Value>]) -> Result<Vec<u8>, ColdError> {
+    let mut fields = Vec::with_capacity(table.columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table.columns.len());
+    for (index, column) in table.columns.iter().enumerate() {
+        let data_type = match column.column_type {
+            ColumnType::Integer => DataType::Int64,
+            ColumnType::Real => DataType::Float64,
+            ColumnType::Text => DataType::Utf8,
+            ColumnType::Boolean => DataType::Boolean,
+            ColumnType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        };
+        fields.push(Field::new(&column.name, data_type.clone(), column.nullable));
+        let array: ArrayRef = match column.column_type {
+            ColumnType::Integer => {
+                Arc::new(Int64Array::from_iter(rows.iter().map(
+                    |row| match row.get(index) {
+                        Some(Value::Integer(value)) => Some(*value),
+                        _ => None,
+                    },
+                )))
+            }
+            ColumnType::Real => {
+                Arc::new(Float64Array::from_iter(rows.iter().map(
+                    |row| match row.get(index) {
+                        Some(Value::Real(value)) => Some(*value),
+                        _ => None,
+                    },
+                )))
+            }
+            ColumnType::Text => {
+                Arc::new(StringArray::from_iter(rows.iter().map(
+                    |row| match row.get(index) {
+                        Some(Value::Text(value)) => Some(value.as_str()),
+                        _ => None,
+                    },
+                )))
+            }
+            ColumnType::Boolean => {
+                Arc::new(BooleanArray::from_iter(rows.iter().map(
+                    |row| match row.get(index) {
+                        Some(Value::Boolean(value)) => Some(*value),
+                        _ => None,
+                    },
+                )))
+            }
+            ColumnType::Timestamp => {
+                let micros = rows
+                    .iter()
+                    .map(|row| match row.get(index) {
+                        Some(Value::Timestamp(value)) => {
+                            chrono::DateTime::parse_from_rfc3339(value)
+                                .ok()
+                                .map(|moment| moment.timestamp_micros())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                Arc::new(TimestampMicrosecondArray::from_iter(micros).with_timezone("UTC"))
+            }
+        };
+        arrays.push(array);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+        .map_err(|error| ColdError::Parquet(error.to_string()))?;
     let properties = parquet::file::properties::WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
     let mut buffer = Vec::new();
     let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, Some(properties))
-        .map_err(|error| ColdError::Conversion(error.to_string()))?;
-    for batch in reader {
-        let batch = batch.map_err(|error| ColdError::Conversion(error.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|error| ColdError::Conversion(error.to_string()))?;
-    }
+        .map_err(|error| ColdError::Parquet(error.to_string()))?;
+    writer
+        .write(&batch)
+        .map_err(|error| ColdError::Parquet(error.to_string()))?;
     writer
         .close()
-        .map_err(|error| ColdError::Conversion(error.to_string()))?;
+        .map_err(|error| ColdError::Parquet(error.to_string()))?;
     Ok(buffer)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ColdObjectMetadata, ColdStore, S3ColdStore, convert_csv_to_parquet, parquet_path_for,
-    };
-    use crate::db::Database;
-    use tempfile::TempDir;
+    use super::{catalog_key, object_key, rows_to_parquet};
+    use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec, Value};
 
-    #[test]
-    fn parquet_path_for_converts_tabular_files() {
-        assert_eq!(
-            parquet_path_for("daily/2026-10-08.csv").as_deref(),
-            Some("daily/2026-10-08.parquet")
-        );
-        assert_eq!(
-            parquet_path_for("ONCHAIN.CSV").as_deref(),
-            Some("ONCHAIN.parquet")
-        );
-        assert_eq!(
-            parquet_path_for("ready.parquet").as_deref(),
-            Some("ready.parquet")
-        );
-        assert_eq!(parquet_path_for("notes.md"), None);
+    fn table() -> TableSpec {
+        TableSpec {
+            primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
+            time_column: "updated_at".to_owned(),
+            granularity: Granularity::Hour,
+            columns: vec![
+                ColumnSpec {
+                    name: "symbol".to_owned(),
+                    column_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnSpec {
+                    name: "updated_at".to_owned(),
+                    column_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+                ColumnSpec {
+                    name: "close".to_owned(),
+                    column_type: ColumnType::Real,
+                    nullable: true,
+                },
+            ],
+        }
     }
 
     #[test]
-    fn converts_csv_to_parquet_round_trip() {
-        let csv = b"price,label\n1.5,alpha\n2.25,beta\n";
-        let parquet_bytes = convert_csv_to_parquet(csv).expect("conversion succeeds");
+    fn parquet_round_trips_declared_columns_only() {
+        let rows = vec![
+            vec![
+                Value::Text("BTCUSDT".to_owned()),
+                Value::Timestamp("2026-10-01T00:00:00.000000Z".to_owned()),
+                Value::Real(1.5),
+            ],
+            vec![
+                Value::Text("BTCUSDT".to_owned()),
+                Value::Timestamp("2026-10-01T00:01:00.000000Z".to_owned()),
+                Value::Null,
+            ],
+        ];
+        let bytes = rows_to_parquet(&table(), &rows).expect("encodes");
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-            bytes::Bytes::from(parquet_bytes),
+            bytes::Bytes::from(bytes),
         )
-        .expect("parquet opens")
+        .expect("opens")
         .build()
-        .expect("reader builds");
-        let batches = reader.collect::<Result<Vec<_>, _>>().expect("batches read");
-        let rows: usize = batches
+        .expect("reader");
+        let batches = reader.collect::<Result<Vec<_>, _>>().expect("reads");
+        let total: usize = batches
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
             .sum();
-        assert_eq!(rows, 2);
-        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(total, 2);
+        let schema = batches[0].schema();
+        let names: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        assert_eq!(names, vec!["symbol", "updated_at", "close"]);
+        assert_eq!(
+            schema.field(1).data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            )
+        );
+        assert_eq!(batches[0].num_columns(), 3);
     }
 
-    #[tokio::test]
-    #[ignore = "requires AWS credentials and network access"]
-    async fn s3_round_trip_smoke() {
-        let state = TempDir::new().expect("state directory");
-        let database = Database::open(state.path()).expect("database opens");
-        let store = S3ColdStore::new(database);
-        let key = format!("tests/round-trip-{}.txt", uuid::Uuid::new_v4());
-        let payload = b"firmament cold storage smoke test".to_vec();
-        let sha256 = crate::files::sha256_hex(&payload);
-        store
-            .put_object(
-                &key,
-                payload.clone(),
-                &ColdObjectMetadata {
-                    sha256: sha256.clone(),
-                    source: "smoke.txt".to_owned(),
-                },
-            )
-            .await
-            .expect("put succeeds");
-        let head = store
-            .head_object(&key)
-            .await
-            .expect("head succeeds")
-            .expect("object exists");
-        assert_eq!(head.size, payload.len() as u64);
-        assert_eq!(head.sha256.as_deref(), Some(sha256.as_str()));
-        let object = store
-            .get_object(&key)
-            .await
-            .expect("get succeeds")
-            .expect("object exists");
-        let bytes = object
-            .body
-            .collect()
-            .await
-            .expect("body collects")
-            .into_bytes();
-        assert_eq!(bytes.as_ref(), payload.as_slice());
-
-        // Clean up with a direct client; the trait deliberately omits deletion.
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(
-                crate::db::DEFAULT_COLD_REGION,
-            ))
-            .load()
-            .await;
-        let client = aws_sdk_s3::Client::new(&config);
-        client
-            .delete_object()
-            .bucket(crate::db::DEFAULT_COLD_BUCKET)
-            .key(&key)
-            .send()
-            .await
-            .expect("cleanup delete succeeds");
+    #[test]
+    fn keys_keep_the_dataset_and_batch_visible() {
+        assert_eq!(
+            object_key("bars", "bars/day=2026-10-01/000007-0000.parquet"),
+            "datasets/bars/bars/day=2026-10-01/000007-0000.parquet"
+        );
+        assert_eq!(catalog_key("bars", 7), "datasets/bars/_catalog/000007.json");
     }
 }

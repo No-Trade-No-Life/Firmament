@@ -1,5 +1,5 @@
-// 浏览器端的目录授权同步：把 Firmament 数据集镜像到用户选择的本地目录。
-// 同步完成后，本地目录是远端数据集的一个子集（只清理曾经同步过、而现在远端已删除的文件）。
+// 浏览器端的目录授权镜像：把数据集的冷库增量下载到用户选择的本地目录。
+// 冷库文件不可变，因此同步只会新增文件：永远不会覆盖，也不会因为远端变化而误删。
 
 export type SyncProgressPhase = "scanning" | "downloading" | "cleaning" | "completed" | "failed"
 
@@ -16,11 +16,13 @@ export type SyncSummary = {
   removed: number
   skipped: number
   bytes: number
+  latestBatch: number
 }
 
 export type SyncStateFile = {
   synced_at: number
   dataset_id: string
+  latest_batch: number
   files: { path: string; sha256: string; size: number }[]
 }
 
@@ -173,26 +175,32 @@ export async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
+// Local mirrors keep the dataset id as the first path segment, so one directory
+// can hold several datasets without collisions and the layout matches the
+// bucket exactly.
+export function mirrorPath(datasetId: string, path: string): string {
+  return `${datasetId}/${path}`
+}
+
 export async function runSync(params: {
   directory: DirectoryHandleLike
   datasetId: string
-  prefix: string
+  latestBatch: number
   files: { path: string; size: number; sha256: string }[]
   download: (path: string) => Promise<ArrayBuffer>
   onProgress: (progress: SyncProgress) => void
 }): Promise<SyncSummary> {
-  const { directory, datasetId, prefix, files, download, onProgress } = params
-  const selected = files.filter((file) => prefix === "" || file.path.startsWith(prefix))
+  const { directory, datasetId, latestBatch, files, download, onProgress } = params
   const previousState = await readState(directory)
   const previous = new Map((previousState?.files ?? []).map((file) => [file.path, file]))
 
-  const planned: typeof selected = []
+  const planned: typeof files = []
   let skipped = 0
-  onProgress({ phase: "scanning", total: selected.length, completed: 0, current: "" })
-  for (let index = 0; index < selected.length; index += 1) {
-    const file = selected[index]
-    onProgress({ phase: "scanning", total: selected.length, completed: index, current: file.path })
-    const existing = await statFile(directory, file.path)
+  onProgress({ phase: "scanning", total: files.length, completed: 0, current: "" })
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index]
+    onProgress({ phase: "scanning", total: files.length, completed: index, current: file.path })
+    const existing = await statFile(directory, mirrorPath(datasetId, file.path))
     const known = previous.get(file.path)
     if (existing && known && known.sha256 === file.sha256 && existing.size === file.size) {
       skipped += 1
@@ -211,19 +219,21 @@ export async function runSync(params: {
     if (digest !== file.sha256) {
       throw new Error(`Checksum mismatch for ${file.path}`)
     }
-    await writeFile(directory, file.path, new Uint8Array(buffer))
+    await writeFile(directory, mirrorPath(datasetId, file.path), new Uint8Array(buffer))
     downloaded += 1
     bytes += file.size
   }
   onProgress({ phase: "downloading", total: planned.length, completed: planned.length, current: "" })
 
-  const keep = new Set(selected.map((file) => file.path))
+  // Files that dropped out of the manifest are the only thing a sync ever
+  // removes; cold objects themselves are immutable.
+  const keep = new Set(files.map((file) => file.path))
   const removals = [...previous.keys()].filter((path) => !keep.has(path))
   onProgress({ phase: "cleaning", total: removals.length, completed: 0, current: "" })
   let removed = 0
   for (const path of removals) {
     try {
-      await removeFile(directory, path)
+      await removeFile(directory, mirrorPath(datasetId, path))
       removed += 1
     } catch (error) {
       if (isNotFound(error)) continue
@@ -234,8 +244,9 @@ export async function runSync(params: {
   await writeState(directory, {
     synced_at: Math.floor(Date.now() / 1000),
     dataset_id: datasetId,
-    files: selected.map((file) => ({ path: file.path, sha256: file.sha256, size: file.size })),
+    latest_batch: latestBatch,
+    files: files.map((file) => ({ path: file.path, sha256: file.sha256, size: file.size })),
   })
-  onProgress({ phase: "completed", total: selected.length, completed: selected.length, current: "" })
-  return { downloaded, removed, skipped, bytes }
+  onProgress({ phase: "completed", total: files.length, completed: files.length, current: "" })
+  return { downloaded, removed, skipped, bytes, latestBatch }
 }

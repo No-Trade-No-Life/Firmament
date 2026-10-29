@@ -33,3 +33,16 @@ export function formatBytes(bytes: number) {
 export function showError(error: Error) {
   toast.error(error.message)
 }
+
+// Ranges are shown inline, so they use the short date+time form instead of the
+// medium one; a full timestamp would be truncated in half a card.
+export function formatRange(from?: string | null, to?: string | null, locale?: string) {
+  const short = (instant?: string | null) => {
+    if (!instant) return "—"
+    const date = new Date(instant)
+    return Number.isNaN(date.getTime())
+      ? instant
+      : new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(date)
+  }
+  return `${short(from)} → ${short(to)}`
+}
