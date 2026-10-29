@@ -99,8 +99,10 @@ fn spawn_cooling(database: Database, cold: Arc<dyn ColdStore>, wake: Arc<Notify>
     let spawned = std::thread::Builder::new()
         .name("firmament-cooling".to_owned())
         .spawn(move || {
+            // I/O is not optional: a pass talks to S3. A runtime without the
+            // I/O driver accepts the request and then never makes progress.
             let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
             {
                 Ok(runtime) => runtime,
