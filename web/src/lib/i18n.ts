@@ -62,8 +62,22 @@ const zh = {
   timezone: "时区",
   timezoneHint: "IANA 名称，例如 Asia/Shanghai；冷库分区也按这个时区切",
   schemaTitle: "表结构",
-  tableJson: "表结构（JSON）",
-  tableJsonHint: "一个数据集就是一张表：建库时声明，之后不可变更；冷库文件不可变，所以表结构必须稳定。",
+  columnName: "列名",
+  columnType: "类型",
+  nullable: "可空",
+  addColumn: "添加列",
+  removeColumn: "删除列",
+  schemaEditorHint: "一个数据集就是一张表：建库时声明，之后不可变更。主键决定「同一行」，时间列必须是时间戳并纳入主键，冷库按它分区。",
+  schemaNeedsColumns: "至少添加一列。",
+  schemaNeedsColumnName: "列名不能为空。",
+  schemaInvalidColumnName: "列名只能用小写字母、数字与下划线，并以字母开头。",
+  schemaDuplicateColumn: "列名不能重复。",
+  schemaNeedsTimeColumn: "指定一个时间列（类型为时间戳）。",
+  typeText: "文本",
+  typeTimestamp: "时间戳",
+  typeInteger: "整数",
+  typeReal: "浮点",
+  typeBoolean: "布尔",
   hotRows: "热库行数",
   coolableRows: "待冷却",
   coldFiles: "冷文件",
@@ -88,7 +102,6 @@ const zh = {
   files: "文件",
   bytes: "大小",
   message: "信息",
-  columns: "列",
   primaryKey: "主键",
   timeColumn: "时间列",
   partition: "分区",
@@ -96,6 +109,7 @@ const zh = {
   granularityHour: "小时",
   granularityDay: "天",
   granularityMonth: "月",
+  granularityHint: "冷库分区粒度：按小时、天或月切分对象路径。",
   openDataset: "查看",
   coldFilesTitle: "冷库文件",
   noColdFiles: "冷库还是空的",
@@ -260,8 +274,22 @@ const en: typeof zh = {
   timezone: "Timezone",
   timezoneHint: "IANA name such as Asia/Shanghai; cold partitions are cut in this timezone too",
   schemaTitle: "Schema",
-  tableJson: "Table schema (JSON)",
-  tableJsonHint: "A dataset is one table: declared at creation and never changed, because cold files are immutable.",
+  columnName: "Column",
+  columnType: "Type",
+  nullable: "Nullable",
+  addColumn: "Add column",
+  removeColumn: "Remove column",
+  schemaEditorHint: "A dataset is one table: declared at creation and never changed. The primary key decides what counts as the same row; the time column must be a timestamp, joins the key, and drives cold partitioning.",
+  schemaNeedsColumns: "Add at least one column.",
+  schemaNeedsColumnName: "Column names cannot be empty.",
+  schemaInvalidColumnName: "Use lowercase letters, digits and underscores, starting with a letter.",
+  schemaDuplicateColumn: "Column names must be unique.",
+  schemaNeedsTimeColumn: "Pick one time column (type timestamp).",
+  typeText: "Text",
+  typeTimestamp: "Timestamp",
+  typeInteger: "Integer",
+  typeReal: "Real",
+  typeBoolean: "Boolean",
   hotRows: "Hot rows",
   coolableRows: "Coolable",
   coldFiles: "Cold files",
@@ -286,7 +314,6 @@ const en: typeof zh = {
   files: "Files",
   bytes: "Size",
   message: "Message",
-  columns: "Columns",
   primaryKey: "Primary key",
   timeColumn: "Time column",
   partition: "Partition",
@@ -294,6 +321,7 @@ const en: typeof zh = {
   granularityHour: "Hour",
   granularityDay: "Day",
   granularityMonth: "Month",
+  granularityHint: "Cold partition granularity: objects are cut by hour, day or month.",
   openDataset: "Open",
   coldFilesTitle: "Cold files",
   noColdFiles: "Cold storage is still empty",
@@ -408,6 +436,14 @@ export function granularityLabel(granularity: "hour" | "day" | "month", t: Copy)
   if (granularity === "hour") return t.granularityHour
   if (granularity === "month") return t.granularityMonth
   return t.granularityDay
+}
+
+export function columnTypeLabel(type: "integer" | "real" | "text" | "boolean" | "timestamp", t: Copy) {
+  if (type === "integer") return t.typeInteger
+  if (type === "real") return t.typeReal
+  if (type === "boolean") return t.typeBoolean
+  if (type === "timestamp") return t.typeTimestamp
+  return t.typeText
 }
 
 export const copy = { zh, en }
