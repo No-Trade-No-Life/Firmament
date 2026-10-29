@@ -19,7 +19,8 @@ import { downloadFile, request, type AuthSdk } from "../lib/api"
 import { formatBytes, formatRange, formatTime, showError } from "../lib/format"
 import { cadenceLabel, granularityLabel, type Copy } from "../lib/i18n"
 import { Pager } from "../components/pager"
-import type { ColdFile, ColumnSpec, DatasetView, Flush, FlushResult, Manifest, TableView } from "../lib/types"
+import { SchemaSummary } from "../components/schema-editor"
+import type { ColdFile, DatasetView, Flush, FlushResult, Manifest, TableView } from "../lib/types"
 
 export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale: string; t: Copy; isRoot: boolean }) {
   const { id = "" } = useParams()
@@ -182,11 +183,7 @@ function TableCard({ table, locale, t }: { table: TableView; locale: string; t: 
       </div>
       <Detail label={t.hotRange} value={formatRange(table.oldest_time, table.newest_time, locale)} />
       <Detail label={t.coldRange} value={formatRange(table.cold_from, table.cold_until, locale)} />
-      <div className="flex flex-wrap gap-1">
-        {table.columns.map((column) => <Badge key={column.name} variant="secondary" className="font-mono text-xs">
-          {columnLabel(column)}
-        </Badge>)}
-      </div>
+      <SchemaSummary table={table} t={t} />
     </CardContent>
   </Card>
 }
@@ -196,10 +193,6 @@ function Detail({ label, value }: { label: string; value: string }) {
     <span className="text-xs text-muted-foreground">{label}</span>
     <span className="truncate text-sm">{value}</span>
   </div>
-}
-
-function columnLabel(column: ColumnSpec) {
-  return `${column.name}:${column.type}${column.nullable ? "?" : ""}`
 }
 
 // A concrete example beats a link to the docs: the sample row is generated from

@@ -11,26 +11,12 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Textarea } from "@/components/ui/textarea"
 import { request, type AuthSdk } from "../lib/api"
 import { formatBytes, showError } from "../lib/format"
 import { cadenceLabel, granularityLabel, type Copy } from "../lib/i18n"
-import type { CoolingCadence, DatasetView, FlushResult, TableSpec } from "../lib/types"
-
-const TABLE_TEMPLATE = `{
-  "primary_key": ["symbol", "updated_at"],
-  "time_column": "updated_at",
-  "granularity": "day",
-  "columns": [
-    { "name": "symbol", "type": "text" },
-    { "name": "updated_at", "type": "timestamp" },
-    { "name": "open", "type": "real" },
-    { "name": "high", "type": "real" },
-    { "name": "low", "type": "real" },
-    { "name": "close", "type": "real" },
-    { "name": "volume", "type": "real" }
-  ]
-}`
+import { SchemaEditor } from "../components/schema-editor"
+import { buildTableSpec, schemaProblem, starterColumns, type ColumnDraft } from "../lib/schema"
+import type { CoolingCadence, DatasetView, FlushResult, Granularity } from "../lib/types"
 
 export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRoot: boolean }) {
   const queryClient = useQueryClient()
@@ -41,23 +27,23 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
   const [description, setDescription] = useState("")
   const [cadence, setCadence] = useState<CoolingCadence>("daily")
   const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
-  const [tableSpec, setTableSpec] = useState(TABLE_TEMPLATE)
+  const [granularity, setGranularity] = useState<Granularity>("day")
+  const [columns, setColumns] = useState<ColumnDraft[]>(starterColumns)
+  const problem = schemaProblem(columns, t)
   const list = datasets.data ?? []
 
   const create = useMutation({
-    mutationFn: () => {
-      const table = JSON.parse(tableSpec) as TableSpec
-      return request<DatasetView>("/api/v1/datasets", auth, {
-        method: "POST",
-        body: JSON.stringify({ id, name, description, cooling: { cadence, timezone }, table }),
-      })
-    },
+    mutationFn: () => request<DatasetView>("/api/v1/datasets", auth, {
+      method: "POST",
+      body: JSON.stringify({ id, name, description, cooling: { cadence, timezone }, table: buildTableSpec(columns, granularity) }),
+    }),
     onSuccess: () => {
       setCreating(false)
       setId("")
       setName("")
       setDescription("")
-      setTableSpec(TABLE_TEMPLATE)
+      setGranularity("day")
+      setColumns(starterColumns())
       toast.success(t.datasetCreated)
       void queryClient.invalidateQueries({ queryKey: ["datasets"] })
     },
@@ -100,7 +86,7 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
     </div>}
 
     <Dialog open={creating} onOpenChange={setCreating}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>{t.newDataset}</DialogTitle>
           <DialogDescription>{t.datasetsDescription}</DialogDescription>
@@ -122,32 +108,45 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
               <FieldLabel htmlFor="dataset-description">{t.datasetDescriptionField}</FieldLabel>
               <Input id="dataset-description" value={description} onChange={(event) => setDescription(event.target.value)} />
             </Field>
-            <Field>
-              <FieldLabel>{t.cadence}</FieldLabel>
-              <Select value={cadence} onValueChange={(value) => setCadence(value as CoolingCadence)}>
-                <SelectTrigger className="max-w-48"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="daily">{t.cadenceDaily}</SelectItem>
-                  <SelectItem value="weekly">{t.cadenceWeekly}</SelectItem>
-                  <SelectItem value="monthly">{t.cadenceMonthly}</SelectItem>
-                </SelectContent>
-              </Select>
-              <FieldDescription>{t.coolingHint}</FieldDescription>
-            </Field>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel>{t.cadence}</FieldLabel>
+                <Select value={cadence} onValueChange={(value) => setCadence(value as CoolingCadence)}>
+                  <SelectTrigger className="w-full"><SelectValue>{(value) => cadenceLabel(value as CoolingCadence, t)}</SelectValue></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="daily">{t.cadenceDaily}</SelectItem>
+                    <SelectItem value="weekly">{t.cadenceWeekly}</SelectItem>
+                    <SelectItem value="monthly">{t.cadenceMonthly}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field>
+                <FieldLabel>{t.granularity}</FieldLabel>
+                <Select value={granularity} onValueChange={(value) => setGranularity(value as Granularity)}>
+                  <SelectTrigger className="w-full"><SelectValue>{(value) => granularityLabel(value as Granularity, t)}</SelectValue></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="hour">{t.granularityHour}</SelectItem>
+                    <SelectItem value="day">{t.granularityDay}</SelectItem>
+                    <SelectItem value="month">{t.granularityMonth}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+            </div>
+            <FieldDescription>{t.coolingHint}</FieldDescription>
+            <FieldDescription>{t.granularityHint}</FieldDescription>
             <Field>
               <FieldLabel htmlFor="dataset-timezone">{t.timezone}</FieldLabel>
               <Input id="dataset-timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} className="max-w-64" required />
               <FieldDescription>{t.timezoneHint}</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="dataset-table">{t.tableJson}</FieldLabel>
-              <Textarea id="dataset-table" className="min-h-64 font-mono text-xs" value={tableSpec} onChange={(event) => setTableSpec(event.target.value)} spellCheck={false} />
-              <FieldDescription>{t.tableJsonHint}</FieldDescription>
+              <FieldLabel>{t.schemaTitle}</FieldLabel>
+              <SchemaEditor columns={columns} onChange={setColumns} t={t} />
             </Field>
           </FieldGroup>
           <div className="flex justify-end gap-2">
             <Button type="button" variant="ghost" onClick={() => setCreating(false)}>{t.cancel}</Button>
-            <Button type="submit" disabled={create.isPending}>{create.isPending ? t.creating : t.create}</Button>
+            <Button type="submit" disabled={create.isPending || problem !== null}>{create.isPending ? t.creating : t.create}</Button>
           </div>
         </form>
       </DialogContent>
