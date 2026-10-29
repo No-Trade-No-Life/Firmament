@@ -153,6 +153,13 @@ async fn sweep_once(database: &Database, cold: &dyn ColdStore) {
                 continue;
             }
         }
+        // A pass that died left claims behind. They are invisible to the
+        // coolable count, so without releasing them first a crash would look
+        // exactly like "nothing to cool" and the rows would never move again.
+        if let Err(error) = database.hot().release_stale_claims(&dataset.id, 0) {
+            eprintln!("firmament: {} stale claims unreadable: {error}", dataset.id);
+            continue;
+        }
         let boundary = cooling::boundary(now, dataset.cadence)
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let coolable = match database
