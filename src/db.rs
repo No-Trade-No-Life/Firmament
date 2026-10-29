@@ -1090,18 +1090,22 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         )
         .optional()?;
     if version.as_deref() != Some(SCHEMA_VERSION) {
-        connection.execute_batch(
-            "DROP TABLE IF EXISTS archive_jobs;
+        // The whole rebuild is one transaction: a half-migrated control plane
+        // would leave the service unable to start at all. Children go before
+        // `datasets`, otherwise the foreign keys block the drop.
+        connection.execute_batch(&format!(
+            "BEGIN;
+             DROP TABLE IF EXISTS archive_jobs;
              DROP TABLE IF EXISTS publish_events;
              DROP TABLE IF EXISTS cold_files;
              DROP TABLE IF EXISTS imports;
+             DROP TABLE IF EXISTS flushes;
              DROP TABLE IF EXISTS syncers;
-             DROP TABLE IF EXISTS datasets;",
-        )?;
-        connection.execute(
-            "INSERT INTO app_meta(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION],
-        )?;
+             DROP TABLE IF EXISTS datasets;
+             INSERT INTO app_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             COMMIT;"
+        ))?;
     }
     Ok(())
 }
@@ -1255,6 +1259,55 @@ mod tests {
                 .expect("lookup")
                 .is_none(),
             "only catalogued paths resolve"
+        );
+    }
+
+    #[test]
+    fn a_schema_bump_rebuilds_a_control_plane_that_has_flush_history() {
+        let state = TempDir::new().expect("state directory");
+        {
+            let connection =
+                rusqlite::Connection::open(state.path().join("default.sqlite3")).expect("opens");
+            connection
+                .execute_batch(
+                    "CREATE TABLE app_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+                     INSERT INTO app_meta(key, value) VALUES ('schema_version', '5');
+                     CREATE TABLE datasets (
+                         id TEXT PRIMARY KEY NOT NULL,
+                         name TEXT NOT NULL,
+                         description TEXT NOT NULL,
+                         spec TEXT NOT NULL,
+                         cadence TEXT NOT NULL,
+                         last_batch INTEGER NOT NULL DEFAULT 0,
+                         created_at INTEGER NOT NULL
+                     );
+                     CREATE TABLE flushes (
+                         id TEXT PRIMARY KEY NOT NULL,
+                         dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                         batch INTEGER NOT NULL,
+                         trigger TEXT NOT NULL,
+                         status TEXT NOT NULL,
+                         files INTEGER NOT NULL DEFAULT 0,
+                         rows INTEGER NOT NULL DEFAULT 0,
+                         bytes INTEGER NOT NULL DEFAULT 0,
+                         message TEXT NOT NULL DEFAULT '',
+                         created_at INTEGER NOT NULL,
+                         finished_at INTEGER,
+                         UNIQUE(dataset_id, batch)
+                     );
+                     INSERT INTO datasets VALUES ('bars','Bars','','{}','daily',1,0);
+                     INSERT INTO flushes VALUES ('f','bars',1,'schedule','completed',0,0,0,'',0,NULL);",
+                )
+                .expect("legacy control plane");
+        }
+
+        let database = Database::open(state.path()).expect("reopens after the bump");
+        assert!(database.list_datasets().expect("list").is_empty());
+        assert!(
+            database
+                .list_flushes("bars", 10)
+                .expect("passes")
+                .is_empty()
         );
     }
 
