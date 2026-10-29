@@ -19,7 +19,7 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { request, requestBytes, type AuthSdk } from "../lib/api"
+import { errorMessage, request, requestBytes, type AuthSdk } from "../lib/api"
 import { formatTime, showError } from "../lib/format"
 import type { Copy } from "../lib/i18n"
 import type { DatasetView, Manifest, Syncer } from "../lib/types"
@@ -55,7 +55,7 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
       setName("")
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
   const remove = useMutation({
     mutationFn: (syncer: Syncer) => request<void>(`/api/v1/syncers/${syncer.id}`, auth, { method: "DELETE" }),
@@ -63,7 +63,7 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
       setRemoving(null)
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
 
   async function run(syncer: Syncer, pick: boolean) {
@@ -93,9 +93,9 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
       toast.success(`${t.syncCompleted}: ↓${summary.downloaded} · ✕${summary.removed} · =${summary.skipped}`)
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = errorMessage(error, t)
       setProgress((previous) => ({ ...previous, [syncer.id]: { phase: "failed", total: 0, completed: 0, current: "", error: message } }))
-      showError(error as Error)
+      showError(error, t)
     } finally {
       setBusy(null)
     }

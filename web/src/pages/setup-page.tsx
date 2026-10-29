@@ -12,7 +12,7 @@ export function SetupPage({ auth, t, onDone }: { auth: AuthSdk; t: Copy; onDone:
   const mutation = useMutation({
     mutationFn: () => request<Me>("/api/v1/setup", auth, { method: "POST" }),
     onSuccess: () => { toast.success(t.setupDone); onDone() },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
   return <div className="mx-auto max-w-xl p-6"><Card><CardHeader><CardTitle>{t.setupTitle}</CardTitle><CardDescription>{t.setupDescription}</CardDescription></CardHeader><CardContent><Button disabled={mutation.isPending} onClick={() => mutation.mutate()}>{t.setupButton}</Button></CardContent></Card></div>
 }

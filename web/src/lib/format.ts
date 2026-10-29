@@ -1,5 +1,8 @@
 import { toast } from "sonner"
 
+import { errorMessage } from "./api"
+import type { Copy } from "./i18n"
+
 export function formatTime(timestamp?: number | null, locale?: string) {
   return timestamp ? `${new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }).format(new Date(timestamp * 1000))} UTC` : "—"
 }
@@ -30,8 +33,8 @@ export function formatBytes(bytes: number) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
 }
 
-export function showError(error: Error) {
-  toast.error(error.message)
+export function showError(error: unknown, t: Copy) {
+  toast.error(errorMessage(error, t))
 }
 
 // Ranges are shown inline, so they use the short date+time form instead of the
