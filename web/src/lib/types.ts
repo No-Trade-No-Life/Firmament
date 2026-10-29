@@ -39,16 +39,16 @@ export type DatasetView = {
   name: string
   description: string
   cadence: CoolingCadence
-  last_batch: number
+  last_revision: number
   created_at: number
   table: TableView
 }
 
 export type ColdFile = {
   dataset_id: string
-  batch: number
+  revision: number
   path: string
-  partition: string
+  bucket: string
   rows: number
   bytes: number
   sha256: string
@@ -59,17 +59,17 @@ export type ColdFile = {
 
 export type Manifest = {
   dataset_id: string
-  latest_batch: number
+  latest_revision: number
   files: ColdFile[]
 }
 
 export type Flush = {
   id: string
   dataset_id: string
-  batch: number
+  pass: number
   trigger: string
   status: "running" | "completed" | "failed"
-  files: number
+  partitions: number
   rows: number
   bytes: number
   message: string
@@ -77,11 +77,9 @@ export type Flush = {
   finished_at: number | null
 }
 
-export type FlushResult = {
-  batch: number
-  files: number
-  rows: number
-  bytes: number
+export type CoolingRequest = {
+  requested: boolean
+  coolable_rows: number
 }
 
 export type Syncer = {
@@ -89,7 +87,7 @@ export type Syncer = {
   owner_id: string
   name: string
   dataset_id: string
-  last_batch: number
+  last_revision: number
   created_at: number
   last_synced_at: number | null
 }

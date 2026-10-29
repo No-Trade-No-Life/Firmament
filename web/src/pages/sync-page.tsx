@@ -77,19 +77,19 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
         if (!(await ensurePermission(handle))) throw new Error(t.syncPermissionDenied)
         await saveDirectoryHandle(syncer.id, handle)
       }
-      // Incremental by batch: the manifest only carries what this mirror has not
+      // Incremental by revision: the manifest only carries what this mirror has not
       // seen yet, so a repeated sync downloads nothing.
-      const query = new URLSearchParams({ since: String(syncer.last_batch) })
+      const query = new URLSearchParams({ since: String(syncer.last_revision) })
       const manifest = await request<Manifest>(`/api/v1/datasets/${syncer.dataset_id}/manifest?${query.toString()}`, auth)
       const summary = await runSync({
         directory: handle,
         datasetId: syncer.dataset_id,
-        latestBatch: manifest.latest_batch,
+        latestRevision: manifest.latest_revision,
         files: manifest.files.map((file) => ({ path: file.path, size: file.bytes, sha256: file.sha256 })),
         download: (path) => requestBytes(`/api/v1/datasets/${syncer.dataset_id}/files/${encodeURI(path)}`, auth),
         onProgress: (value) => setProgress((previous) => ({ ...previous, [syncer.id]: value })),
       })
-      await request(`/api/v1/syncers/${syncer.id}/completed`, auth, { method: "POST", body: JSON.stringify({ batch: summary.latestBatch }) })
+      await request(`/api/v1/syncers/${syncer.id}/completed`, auth, { method: "POST", body: JSON.stringify({ revision: summary.latestRevision }) })
       toast.success(`${t.syncCompleted}: ↓${summary.downloaded} · ✕${summary.removed} · =${summary.skipped}`)
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     } catch (error) {
@@ -140,7 +140,7 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
           <TableHeader><TableRow>
             <TableHead>{t.syncerName}</TableHead>
             <TableHead>{t.syncerDataset}</TableHead>
-            <TableHead>{t.mirroredBatch}</TableHead>
+            <TableHead>{t.mirroredRevision}</TableHead>
             <TableHead>{t.lastSynced}</TableHead>
             <TableHead className="text-right" />
           </TableRow></TableHeader>
@@ -149,7 +149,7 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
             return <TableRow key={syncer.id}>
               <TableCell className="font-medium">{syncer.name}</TableCell>
               <TableCell className="font-mono text-xs">{syncer.dataset_id}</TableCell>
-              <TableCell className="font-mono text-xs">{syncer.last_batch}</TableCell>
+              <TableCell className="font-mono text-xs">{syncer.last_revision}</TableCell>
               <TableCell className="text-muted-foreground">
                 {syncer.last_synced_at ? formatTime(syncer.last_synced_at, locale) : t.neverSynced}
                 {state && state.phase !== "completed" && state.phase !== "failed" && <span className="ml-2 text-xs">{phaseLabel(state, t)}</span>}

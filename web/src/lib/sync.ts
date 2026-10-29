@@ -16,13 +16,13 @@ export type SyncSummary = {
   removed: number
   skipped: number
   bytes: number
-  latestBatch: number
+  latestRevision: number
 }
 
 export type SyncStateFile = {
   synced_at: number
   dataset_id: string
-  latest_batch: number
+  last_revision: number
   files: { path: string; sha256: string; size: number }[]
 }
 
@@ -185,12 +185,12 @@ export function mirrorPath(datasetId: string, path: string): string {
 export async function runSync(params: {
   directory: DirectoryHandleLike
   datasetId: string
-  latestBatch: number
+  latestRevision: number
   files: { path: string; size: number; sha256: string }[]
   download: (path: string) => Promise<ArrayBuffer>
   onProgress: (progress: SyncProgress) => void
 }): Promise<SyncSummary> {
-  const { directory, datasetId, latestBatch, files, download, onProgress } = params
+  const { directory, datasetId, latestRevision, files, download, onProgress } = params
   const previousState = await readState(directory)
   const previous = new Map((previousState?.files ?? []).map((file) => [file.path, file]))
 
@@ -225,8 +225,9 @@ export async function runSync(params: {
   }
   onProgress({ phase: "downloading", total: planned.length, completed: planned.length, current: "" })
 
-  // Files that dropped out of the manifest are the only thing a sync ever
-  // removes; cold objects themselves are immutable.
+  // A partition is a full snapshot of its bucket, so a rewrite shows up as a
+  // changed sha256 for the same path. Paths that dropped out of the manifest are
+  // the only thing a sync removes.
   const keep = new Set(files.map((file) => file.path))
   const removals = [...previous.keys()].filter((path) => !keep.has(path))
   onProgress({ phase: "cleaning", total: removals.length, completed: 0, current: "" })
@@ -244,9 +245,9 @@ export async function runSync(params: {
   await writeState(directory, {
     synced_at: Math.floor(Date.now() / 1000),
     dataset_id: datasetId,
-    latest_batch: latestBatch,
+    last_revision: latestRevision,
     files: files.map((file) => ({ path: file.path, sha256: file.sha256, size: file.size })),
   })
   onProgress({ phase: "completed", total: files.length, completed: files.length, current: "" })
-  return { downloaded, removed, skipped, bytes, latestBatch }
+  return { downloaded, removed, skipped, bytes, latestRevision }
 }

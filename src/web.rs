@@ -16,11 +16,11 @@ use chrono::Utc;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::cold::{ColdStore, object_key};
+use crate::cold::{self, ColdStore, object_key};
 use crate::cooling::Cadence;
 use crate::crypto::write_token_secret;
 use crate::db::{
@@ -28,7 +28,7 @@ use crate::db::{
     LinkitStatus, META_COLD_BUCKET, META_COLD_REGION, Syncer, WriteToken, WriteTokenCreated,
 };
 use crate::files::sha256_hex;
-use crate::flush::{FlushReport, cooling_boundary, run_flush};
+use crate::flush::cooling_boundary;
 use crate::hot::{HotError, row_json};
 use crate::linkit::{self, LinkitError};
 use crate::resources::{ResourceMonitor, SystemResourcesSnapshot};
@@ -39,6 +39,9 @@ struct AppState {
     database: Database,
     resources: Arc<Mutex<ResourceMonitor>>,
     cold: Arc<dyn ColdStore>,
+    /// Wakes the cooling thread so a manual request does not wait for the next
+    /// tick.
+    wake: Arc<Notify>,
 }
 
 #[derive(RustEmbed)]
@@ -49,17 +52,23 @@ struct WebAssets;
 // hundred thousand candles, which is far more than a publisher needs per call.
 const INGEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
+// One cold partition, not a database: a day of 1-minute bars for a hundred
+// symbols is a few hundred kilobytes.
+const IMPORT_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
 /// Builds the application router.
 pub fn router(
     database: Database,
     resources: Arc<Mutex<ResourceMonitor>>,
     cold: Arc<dyn ColdStore>,
     auth: AuthMiniLayer,
+    wake: Arc<Notify>,
 ) -> Router {
     let state = AppState {
         database,
         resources,
         cold,
+        wake,
     };
     let private = Router::new()
         .route("/me", get(me))
@@ -92,9 +101,15 @@ pub fn router(
     let ingest = Router::new()
         .route("/{dataset_id}", post(ingest_rows))
         .route_layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT));
+    // Parquet import is a write-side operation with the same write tokens, so it
+    // lives outside the session layer next to ingest.
+    let import = Router::new()
+        .route("/{dataset_id}", post(import_parquet))
+        .route_layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT));
     Router::new()
         .route("/api/health", get(health))
         .nest("/api/v1/ingest", ingest)
+        .nest("/api/v1/import", import)
         .nest("/api/v1", private)
         .fallback(static_asset)
         .with_state(state)
@@ -213,7 +228,7 @@ struct DatasetView {
     name: String,
     description: String,
     cadence: Cadence,
-    last_batch: i64,
+    last_revision: i64,
     created_at: i64,
     table: TableView,
 }
@@ -230,7 +245,7 @@ fn dataset_view(database: &Database, id: &str) -> Result<DatasetView, ApiError> 
         name: dataset.name,
         description: dataset.description,
         cadence: dataset.cadence,
-        last_batch: dataset.last_batch,
+        last_revision: dataset.last_revision,
         created_at: dataset.created_at,
         table: TableView {
             primary_key: dataset.table.primary_key,
@@ -241,7 +256,7 @@ fn dataset_view(database: &Database, id: &str) -> Result<DatasetView, ApiError> 
             coolable_rows: stats.coolable_rows,
             oldest_time: stats.oldest_time,
             newest_time: stats.newest_time,
-            cold_files: cold.files,
+            cold_files: cold.partitions,
             cold_bytes: cold.bytes,
             cold_from: cold.earliest_time,
             cold_until: cold.latest_time,
@@ -312,7 +327,7 @@ async fn dataset_detail(
 #[derive(Debug, Serialize)]
 struct ManifestView {
     dataset_id: String,
-    latest_batch: i64,
+    latest_revision: i64,
     files: Vec<crate::db::ColdFile>,
 }
 
@@ -334,7 +349,7 @@ async fn dataset_manifest(
     let files = state.database.cold_files(&dataset.id, query.since.max(0))?;
     Ok(Json(ManifestView {
         dataset_id: dataset.id,
-        latest_batch: dataset.last_batch,
+        latest_revision: dataset.last_revision,
         files,
     }))
 }
@@ -406,11 +421,9 @@ async fn dataset_file(
 }
 
 #[derive(Debug, Serialize)]
-struct FlushResponse {
-    batch: i64,
-    files: i64,
-    rows: i64,
-    bytes: u64,
+struct CoolingRequest {
+    requested: bool,
+    coolable_rows: i64,
 }
 
 async fn list_flushes(
@@ -423,29 +436,32 @@ async fn list_flushes(
     Ok(Json(state.database.list_flushes(&id, 20)?))
 }
 
+// Cooling never runs inside a write or a read: this only wakes the cooling
+// thread, which then takes the pass at its own pace.
 async fn start_flush(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<FlushResponse>, ApiError> {
+) -> Result<(StatusCode, Json<CoolingRequest>), ApiError> {
     Actor::from_principal(&state.database, &principal)?.assert_root()?;
-    if state.database.dataset(&id)?.is_none() {
-        return Err(ApiError::not_found());
-    }
-    if let Some(flush) = state.database.latest_flush(&id)?
-        && flush.status == "running"
-    {
-        return Err(ApiError::conflict("a cooling pass is already running"));
-    }
-    let report: FlushReport = run_flush(&state.database, state.cold.as_ref(), &id, "manual")
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(FlushResponse {
-        batch: report.batch,
-        files: report.files,
-        rows: report.rows,
-        bytes: report.bytes,
-    }))
+    let dataset = state
+        .database
+        .dataset(&id)?
+        .ok_or_else(ApiError::not_found)?;
+    let boundary = cooling_boundary(Utc::now(), dataset.cadence);
+    let coolable_rows = state
+        .database
+        .hot()
+        .stats(&dataset.id, &dataset.table, &boundary)?
+        .coolable_rows;
+    state.wake.notify_one();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CoolingRequest {
+            requested: true,
+            coolable_rows,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,6 +520,73 @@ async fn ingest_rows(
         dataset_id: dataset.id,
         upserted: counts.upserted,
         deleted: counts.deleted,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct ImportResponse {
+    dataset_id: String,
+    /// Rows the request carried.
+    rows: i64,
+    /// Rows actually written; zero when the file was already imported.
+    upserted: i64,
+    /// Whether this file had already been applied.
+    skipped: bool,
+}
+
+// Parquet import is the bulk door next to the row-by-row ingest API: the object
+// is decoded, cleaned against the declared schema and written to the hot store,
+// where it waits for the next cooling pass. Nothing is written to cold storage
+// here, so the request costs one SQLite transaction.
+async fn import_parquet(
+    State(state): State<AppState>,
+    Path(dataset_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let secret =
+        bearer_token(&headers).ok_or_else(|| ApiError::unauthorized("write token is required"))?;
+    let token = state
+        .database
+        .write_token_by_secret_hash(&sha256_hex(secret.as_bytes()))?
+        .ok_or_else(|| ApiError::unauthorized("unknown write token"))?;
+    let dataset = state
+        .database
+        .dataset(&dataset_id)?
+        .ok_or_else(ApiError::not_found)?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("import carries no Parquet object"));
+    }
+    let digest = sha256_hex(&body);
+    if let Some(rows) = state.database.imported_rows(&dataset.id, &digest)? {
+        return Ok(Json(ImportResponse {
+            dataset_id: dataset.id,
+            rows,
+            upserted: 0,
+            skipped: true,
+        }));
+    }
+    let rows = cold::parquet_to_rows(&dataset.table, &body)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let counts = state
+        .database
+        .hot()
+        .insert_typed(&dataset.id, &dataset.table, rows.clone())?;
+    state
+        .database
+        .record_import(&dataset.id, &digest, rows.len() as i64)?;
+    state
+        .database
+        .record_ingest_event(&dataset.id, counts.upserted, 0, &token.id, &token.name)?;
+    state
+        .database
+        .touch_write_token(&token.id, Utc::now().timestamp())?;
+    state.wake.notify_one();
+    Ok(Json(ImportResponse {
+        dataset_id: dataset.id,
+        rows: rows.len() as i64,
+        upserted: counts.upserted,
+        skipped: false,
     }))
 }
 

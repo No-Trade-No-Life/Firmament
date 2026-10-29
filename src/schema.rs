@@ -58,17 +58,6 @@ pub enum Granularity {
     Month,
 }
 
-impl Granularity {
-    /// The partition key used in object paths (`hour=2026-10-01T13`).
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Hour => "hour",
-            Self::Day => "day",
-            Self::Month => "month",
-        }
-    }
-}
-
 /// One declared column.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ColumnSpec {

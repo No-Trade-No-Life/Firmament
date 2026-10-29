@@ -16,7 +16,7 @@ import { formatBytes, showError } from "../lib/format"
 import { cadenceLabel, granularityLabel, type Copy } from "../lib/i18n"
 import { SchemaEditor } from "../components/schema-editor"
 import { buildTableSpec, schemaProblem, starterColumns, type ColumnDraft } from "../lib/schema"
-import type { CoolingCadence, DatasetView, FlushResult, Granularity } from "../lib/types"
+import type { CoolingCadence, CoolingRequest, DatasetView, Granularity } from "../lib/types"
 
 export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRoot: boolean }) {
   const queryClient = useQueryClient()
@@ -151,9 +151,9 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
 function FlushButton({ auth, dataset, t }: { auth: AuthSdk; dataset: DatasetView; t: Copy }) {
   const queryClient = useQueryClient()
   const flush = useMutation({
-    mutationFn: () => request<FlushResult>(`/api/v1/datasets/${dataset.id}/flushes`, auth, { method: "POST" }),
+    mutationFn: () => request<CoolingRequest>(`/api/v1/datasets/${dataset.id}/flushes`, auth, { method: "POST" }),
     onSuccess: (result) => {
-      toast.success(`${t.flushed} · batch ${result.batch} · ${result.rows} ${t.rows}`)
+      toast.success(`${t.coolingRequested} · ${result.coolable_rows.toLocaleString()} ${t.rows}`)
       void queryClient.invalidateQueries()
     },
     onError: (error) => showError(error instanceof Error ? error : new Error(String(error))),

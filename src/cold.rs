@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -27,7 +27,7 @@ use crate::db::{
     DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, META_COLD_BUCKET,
     META_COLD_REGION,
 };
-use crate::schema::{ColumnType, TableSpec, Value};
+use crate::schema::{ColumnSpec, ColumnType, TableSpec, Value};
 
 #[derive(Debug, Error)]
 pub enum ColdError {
@@ -190,11 +190,6 @@ pub fn object_key(dataset_id: &str, path: &str) -> String {
     format!("datasets/{dataset_id}/{path}")
 }
 
-/// The object key of the catalogue record of one batch.
-pub fn catalog_key(dataset_id: &str, batch: i64) -> String {
-    format!("datasets/{dataset_id}/_catalog/{batch:06}.json")
-}
-
 /// Encodes rows of one table into a Snappy Parquet file.
 ///
 /// # Errors
@@ -281,9 +276,101 @@ pub fn rows_to_parquet(table: &TableSpec, rows: &[Vec<Value>]) -> Result<Vec<u8>
     Ok(buffer)
 }
 
+/// Decodes one cold partition back into rows of the declared table.
+///
+/// # Errors
+///
+/// Returns an error when the object is not readable Parquet or does not carry
+/// the declared columns with the declared types.
+pub fn parquet_to_rows(table: &TableSpec, body: &[u8]) -> Result<Vec<Vec<Value>>, ColdError> {
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(body),
+    )
+    .map_err(|error| ColdError::Parquet(error.to_string()))?
+    .build()
+    .map_err(|error| ColdError::Parquet(error.to_string()))?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|error| ColdError::Parquet(error.to_string()))?;
+        let mut columns = Vec::with_capacity(table.columns.len());
+        for column in &table.columns {
+            let index = batch.schema().index_of(&column.name).map_err(|_| {
+                ColdError::Parquet(format!("the object has no column {}", column.name))
+            })?;
+            columns.push(
+                arrow::compute::cast(batch.column(index), &target_type(column)).map_err(
+                    |error| {
+                        ColdError::Parquet(format!(
+                            "column {} does not hold a {:?}: {error}",
+                            column.name, column.column_type
+                        ))
+                    },
+                )?,
+            );
+        }
+        for index in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(columns.len());
+            for (column, array) in table.columns.iter().zip(&columns) {
+                values.push(cell(column, array.as_ref(), index)?);
+            }
+            rows.push(values);
+        }
+    }
+    Ok(rows)
+}
+
+fn target_type(column: &ColumnSpec) -> DataType {
+    match column.column_type {
+        ColumnType::Integer => DataType::Int64,
+        ColumnType::Real => DataType::Float64,
+        ColumnType::Text => DataType::Utf8,
+        ColumnType::Boolean => DataType::Boolean,
+        ColumnType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    }
+}
+
+fn cell(column: &ColumnSpec, array: &dyn Array, index: usize) -> Result<Value, ColdError> {
+    if array.is_null(index) {
+        return if column.nullable {
+            Ok(Value::Null)
+        } else {
+            Err(ColdError::Parquet(format!(
+                "column {} holds a null",
+                column.name
+            )))
+        };
+    }
+    let value = match column.column_type {
+        ColumnType::Integer => Value::Integer(downcast::<Int64Array>(array)?.value(index)),
+        ColumnType::Real => Value::Real(downcast::<Float64Array>(array)?.value(index)),
+        ColumnType::Text => Value::Text(downcast::<StringArray>(array)?.value(index).to_owned()),
+        ColumnType::Boolean => Value::Boolean(downcast::<BooleanArray>(array)?.value(index)),
+        ColumnType::Timestamp => {
+            let micros = downcast::<TimestampMicrosecondArray>(array)?.value(index);
+            let moment = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+                ColdError::Parquet(format!(
+                    "column {} holds an out-of-range instant",
+                    column.name
+                ))
+            })?;
+            Value::Timestamp(moment.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
+    };
+    Ok(value)
+}
+
+fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T, ColdError> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        ColdError::Parquet(format!(
+            "a decoded column has an unsupported physical type {:?}",
+            array.data_type()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{catalog_key, object_key, rows_to_parquet};
+    use super::{object_key, parquet_to_rows, rows_to_parquet};
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec, Value};
 
     fn table() -> TableSpec {
@@ -326,6 +413,11 @@ mod tests {
             ],
         ];
         let bytes = rows_to_parquet(&table(), &rows).expect("encodes");
+        assert_eq!(
+            parquet_to_rows(&table(), &bytes).expect("decodes"),
+            rows,
+            "the decoder rebuilds the rows the writer stored"
+        );
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
             bytes::Bytes::from(bytes),
         )
@@ -356,11 +448,23 @@ mod tests {
     }
 
     #[test]
-    fn keys_keep_the_dataset_and_batch_visible() {
+    fn the_decoder_rejects_an_object_without_the_declared_columns() {
+        let mut narrow = table();
+        narrow.columns.pop();
+        let rows = vec![vec![
+            Value::Text("BTCUSDT".to_owned()),
+            Value::Timestamp("2026-10-01T00:00:00.000000Z".to_owned()),
+        ]];
+        let bytes = rows_to_parquet(&narrow, &rows).expect("encodes");
+        let error = parquet_to_rows(&table(), &bytes).expect_err("missing column");
+        assert!(error.to_string().contains("close"), "{error}");
+    }
+
+    #[test]
+    fn keys_live_under_the_dataset_prefix() {
         assert_eq!(
-            object_key("bars", "bars/day=2026-10-01/000007-0000.parquet"),
-            "datasets/bars/bars/day=2026-10-01/000007-0000.parquet"
+            object_key("bars", "2026-10-01.parquet"),
+            "datasets/bars/2026-10-01.parquet"
         );
-        assert_eq!(catalog_key("bars", 7), "datasets/bars/_catalog/000007.json");
     }
 }
