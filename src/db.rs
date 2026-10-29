@@ -357,6 +357,7 @@ impl Database {
         };
         database.put_meta_if_missing(META_COLD_BUCKET, DEFAULT_COLD_BUCKET)?;
         database.put_meta_if_missing(META_COLD_REGION, DEFAULT_COLD_REGION)?;
+        database.fail_interrupted_passes()?;
         database.reapply_schemas()?;
         Ok(database)
     }
@@ -966,6 +967,17 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    // A pass only runs inside this process, so anything still marked running at
+    // startup belongs to a process that died. Leaving it alone would wedge the
+    // dataset: every later pass refuses to start while one is "running".
+    fn fail_interrupted_passes(&self) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "UPDATE flushes SET status = 'failed', message = 'interrupted by a restart', finished_at = ?1 WHERE status = 'running'",
+            [Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
     fn reapply_schemas(&self) -> Result<(), DatabaseError> {
         for dataset in self.list_datasets()? {
             self.hot.apply_schema(&dataset.id, &dataset.table)?;
@@ -1259,6 +1271,32 @@ mod tests {
                 .expect("lookup")
                 .is_none(),
             "only catalogued paths resolve"
+        );
+    }
+
+    #[test]
+    fn a_restart_fails_the_pass_that_was_running() {
+        let state = TempDir::new().expect("state directory");
+        {
+            let database = Database::open(state.path()).expect("database opens");
+            database
+                .create_dataset("bars", "Bars", "", daily(), &bars())
+                .expect("dataset creates");
+            database
+                .begin_pass("bars", "schedule")
+                .expect("pass starts");
+        }
+
+        let database = Database::open(state.path()).expect("database reopens");
+        let pass = database
+            .latest_flush("bars")
+            .expect("latest")
+            .expect("exists");
+        assert_eq!(pass.status, "failed");
+        assert!(pass.message.contains("restart"), "{}", pass.message);
+        assert!(
+            database.begin_pass("bars", "schedule").is_ok(),
+            "cooling is not wedged by the dead pass"
         );
     }
 
