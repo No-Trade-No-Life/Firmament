@@ -29,6 +29,10 @@ const zh = {
   chooseDataset: "选择数据集",
   updated: "更新于",
   error: "出错了",
+  errorNetwork: "无法连接到服务，请检查网络后重试",
+  errorRejected: "服务端拒绝了这次请求",
+  errorServerUnavailable: "服务暂时不可用，请稍后重试",
+  errorBadResponse: "服务返回了无法识别的响应",
   retry: "重试",
 
   overviewTitle: "数据天穹",
@@ -245,6 +249,10 @@ const en: typeof zh = {
   chooseDataset: "Select a dataset",
   updated: "Updated",
   error: "Something went wrong",
+  errorNetwork: "Cannot reach the service — check your connection and try again",
+  errorRejected: "The server rejected this request",
+  errorServerUnavailable: "The service is temporarily unavailable — try again shortly",
+  errorBadResponse: "The server returned a response this app cannot read",
   retry: "Retry",
 
   overviewTitle: "The data firmament",

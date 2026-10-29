@@ -15,12 +15,12 @@ export function LinkitPage({ auth, locale, t }: { auth: AuthSdk; locale: string;
   const ensure = useMutation({
     mutationFn: () => request<LinkitStatus>("/api/v1/linkit", auth, { method: "POST" }),
     onSuccess: (value) => client.setQueryData(["linkit"], value),
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
   const test = useMutation({
     mutationFn: () => request<{ sent: boolean }>("/api/v1/linkit/test", auth, { method: "POST" }),
     onSuccess: () => toast.success(t.linkitTestSent),
-    onError: showError,
+    onError: (error) => showError(error, t),
     onSettled: () => void client.invalidateQueries({ queryKey: ["linkit"] }),
   })
   const busy = ensure.isPending || test.isPending

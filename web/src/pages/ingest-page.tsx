@@ -80,7 +80,7 @@ export function IngestPage({ auth, locale, t }: { auth: AuthSdk; locale: string;
       toast.success(t.tokenCreated)
       void queryClient.invalidateQueries({ queryKey: ["write-tokens"] })
     },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
   const revoke = useMutation({
     mutationFn: (token: WriteToken) => request<void>(`/api/v1/write-tokens/${token.id}`, auth, { method: "DELETE" }),
@@ -89,7 +89,7 @@ export function IngestPage({ auth, locale, t }: { auth: AuthSdk; locale: string;
       toast.success(t.tokenRevoked)
       void queryClient.invalidateQueries({ queryKey: ["write-tokens"] })
     },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
 
   return <div className="flex flex-col gap-6">
@@ -154,7 +154,7 @@ export function IngestPage({ auth, locale, t }: { auth: AuthSdk; locale: string;
           <code className="flex-1 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-xs">{created?.secret ?? ""}</code>
           <Button size="icon-sm" variant="outline" aria-label={t.copy} onClick={() => {
             if (!created) return
-            void navigator.clipboard.writeText(created.secret).then(() => toast.success(t.copied)).catch(showError)
+            void navigator.clipboard.writeText(created.secret).then(() => toast.success(t.copied)).catch((error) => showError(error, t))
           }}><CopyIcon /></Button>
         </div>
       </DialogContent>

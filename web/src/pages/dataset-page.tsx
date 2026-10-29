@@ -34,7 +34,7 @@ export function DatasetPage({ auth, locale, t, isRoot }: { auth: AuthSdk; locale
       toast.success(`${t.coolingRequested} · ${result.coolable_rows.toLocaleString()} ${t.rows}`)
       void queryClient.invalidateQueries()
     },
-    onError: (error) => showError(error instanceof Error ? error : new Error(String(error))),
+    onError: (error) => showError(error, t),
   })
 
   if (dataset.isPending) return <p className="text-sm text-muted-foreground">…</p>
@@ -132,7 +132,7 @@ function ColdFilesTable({ files, datasetId, auth, t }: {
         <span className="truncate font-mono text-xs">{info.getValue()}</span>
         <Button size="icon-sm" variant="ghost" aria-label={t.download} onClick={() => {
           const path = info.getValue()
-          void downloadFile(`/api/v1/datasets/${datasetId}/files/${encodeURI(path)}`, auth, path.split("/").pop() ?? path).catch(showError)
+          void downloadFile(`/api/v1/datasets/${datasetId}/files/${encodeURI(path)}`, auth, path.split("/").pop() ?? path).catch((error) => showError(error, t))
         }}><DownloadIcon /></Button>
       </div>,
     }),

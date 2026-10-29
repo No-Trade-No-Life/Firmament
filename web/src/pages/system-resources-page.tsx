@@ -61,7 +61,7 @@ function ColdStorageCard({ auth, t }: { auth: AuthSdk; t: Copy }) {
   const save = useMutation({
     mutationFn: () => request<ColdSettings>("/api/v1/cold", auth, { method: "PUT", body: JSON.stringify({ bucket, region, endpoint, access_key_id: accessKeyId, secret_access_key: secretAccessKey }) }),
     onSuccess: () => { toast.success(t.coldSaved); void queryClient.invalidateQueries({ queryKey: ["cold-settings"] }) },
-    onError: showError,
+    onError: (error) => showError(error, t),
   })
   if (settings.isPending || !settings.data) return null
   return <Card>

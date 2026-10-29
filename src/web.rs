@@ -7,7 +7,10 @@ use auth_mini_axum::{AuthMiniLayer, AuthMiniPrincipal};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Extension, Path, Query, State},
+    extract::{
+        DefaultBodyLimit, Extension, FromRequest, Path, Query, Request, State,
+        rejection::JsonRejection,
+    },
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -295,7 +298,7 @@ fn valid_dataset_id(id: &str) -> bool {
 async fn create_dataset(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-    Json(input): Json<DatasetInput>,
+    ApiJson(input): ApiJson<DatasetInput>,
 ) -> Result<(StatusCode, Json<DatasetView>), ApiError> {
     Actor::from_principal(&state.database, &principal)?.assert_root()?;
     let id = input.id.trim().to_ascii_lowercase();
@@ -612,7 +615,7 @@ async fn list_syncers(
 async fn create_syncer(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-    Json(input): Json<SyncerInput>,
+    ApiJson(input): ApiJson<SyncerInput>,
 ) -> Result<(StatusCode, Json<Syncer>), ApiError> {
     let name = input.name.trim();
     if name.is_empty() {
@@ -645,14 +648,18 @@ async fn remove_syncer(
 
 #[derive(Debug, Deserialize)]
 struct SyncerCompleted {
-    batch: i64,
+    /// The cold revision this mirror now holds. `batch` is the name the field had
+    /// before the frontend was renamed to `revision`, and a page cached from an
+    /// older bundle still posts it, so both spellings are accepted.
+    #[serde(alias = "batch")]
+    revision: i64,
 }
 
 async fn mark_syncer_completed(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
     Path(id): Path<String>,
-    Json(input): Json<SyncerCompleted>,
+    ApiJson(input): ApiJson<SyncerCompleted>,
 ) -> Result<Json<Syncer>, ApiError> {
     let actor = Actor::from_principal(&state.database, &principal)?;
     let syncer = state
@@ -662,7 +669,7 @@ async fn mark_syncer_completed(
     actor.assert_owner(&syncer.owner_id)?;
     let updated = state
         .database
-        .mark_syncer_synced(&id, Utc::now().timestamp(), input.batch.max(0))?
+        .mark_syncer_synced(&id, Utc::now().timestamp(), input.revision.max(0))?
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(updated))
 }
@@ -683,7 +690,7 @@ async fn list_write_tokens(
 async fn create_write_token(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-    Json(input): Json<WriteTokenInput>,
+    ApiJson(input): ApiJson<WriteTokenInput>,
 ) -> Result<(StatusCode, Json<WriteTokenCreated>), ApiError> {
     Actor::from_principal(&state.database, &principal)?.assert_root()?;
     let name = input.name.trim();
@@ -813,7 +820,7 @@ struct ColdSettingsInput {
 async fn put_cold_settings(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthMiniPrincipal>,
-    Json(input): Json<ColdSettingsInput>,
+    ApiJson(input): ApiJson<ColdSettingsInput>,
 ) -> Result<Json<ColdSettingsView>, ApiError> {
     Actor::from_principal(&state.database, &principal)?.assert_root()?;
     let bucket = input.bucket.trim().to_ascii_lowercase();
@@ -901,6 +908,41 @@ async fn static_asset(uri: axum::extract::OriginalUri) -> Response {
         Body::from(asset.data.into_owned()),
     )
         .into_response()
+}
+
+/// A `Json` body that reports a bad body through [`ApiError`].
+///
+/// `Json`'s own rejection answers with `text/plain`, so a browser that parses
+/// every response as JSON reports `Unexpected token 'F', "Failed to "...` instead
+/// of the actual reason. Routing the rejection through `ApiError` keeps every
+/// API failure in the same `{"error": "..."}` envelope.
+#[derive(Debug)]
+struct ApiJson<T>(T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(request, state).await?;
+        Ok(Self(value))
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        // The outermost source carries the useful part ("missing field `revision`
+        // at line 1 column 27"); `body_text` repeats the rejection category.
+        let detail = std::error::Error::source(&rejection)
+            .map_or_else(|| rejection.body_text(), ToString::to_string);
+        Self {
+            status: rejection.status(),
+            message: format!("invalid request body: {detail}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1003,12 +1045,85 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Method, StatusCode, header},
+        routing::post,
+    };
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
-    use super::dataset_view;
+    use super::{ApiJson, SyncerCompleted, dataset_view};
     use crate::cooling::Cadence;
     use crate::db::Database;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct Probe {
+        revision: i64,
+    }
+
+    async fn echo_probe(ApiJson(probe): ApiJson<Probe>) -> axum::Json<Probe> {
+        axum::Json(probe)
+    }
+
+    const BODY_LIMIT: usize = 16 * 1024;
+
+    async fn post_json(uri: &str, body: &'static str) -> axum::response::Response {
+        Router::new()
+            .route(uri, post(echo_probe))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    #[test]
+    fn the_completed_body_reads_revision_and_still_accepts_the_legacy_batch_name() {
+        let current: SyncerCompleted =
+            serde_json::from_str(r#"{"revision": 5}"#).expect("revision");
+        assert_eq!(current.revision, 5);
+        let legacy: SyncerCompleted =
+            serde_json::from_str(r#"{"batch": 5}"#).expect("legacy batch");
+        assert_eq!(legacy.revision, 5);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_does_not_match_the_shape_answers_with_the_json_error_envelope() {
+        let response = post_json("/probe", r#"{"batch": 5}"#).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), BODY_LIMIT)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json envelope");
+        let message = body["error"].as_str().expect("error message");
+        assert!(message.contains("missing field `revision`"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_json_answers_with_the_same_envelope() {
+        let response = post_json("/probe", "revision=5").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), BODY_LIMIT)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json envelope");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty())
+        );
+    }
 
     fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
         ColumnSpec {

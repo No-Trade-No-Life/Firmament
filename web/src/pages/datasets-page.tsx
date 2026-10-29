@@ -46,7 +46,7 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
       toast.success(t.datasetCreated)
       void queryClient.invalidateQueries({ queryKey: ["datasets"] })
     },
-    onError: (error) => showError(error instanceof Error ? error : new Error(String(error))),
+    onError: (error) => showError(error, t),
   })
 
   return <div className="flex flex-col gap-6">
@@ -156,7 +156,7 @@ function FlushButton({ auth, dataset, t }: { auth: AuthSdk; dataset: DatasetView
       toast.success(`${t.coolingRequested} · ${result.coolable_rows.toLocaleString()} ${t.rows}`)
       void queryClient.invalidateQueries()
     },
-    onError: (error) => showError(error instanceof Error ? error : new Error(String(error))),
+    onError: (error) => showError(error, t),
   })
   return <Button size="sm" variant="ghost" disabled={flush.isPending} onClick={() => flush.mutate()}>
     <FlameIcon data-icon="inline-start" />{flush.isPending ? t.flushing : t.flush}
