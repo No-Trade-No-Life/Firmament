@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, params, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value as Json};
 
@@ -37,15 +37,6 @@ pub struct IngestCounts {
     pub upserted: i64,
     /// Rows removed from the hot window.
     pub deleted: i64,
-}
-
-/// One row read back from the hot window.
-#[derive(Clone, Debug)]
-pub struct HotRow {
-    /// Cell values in declared column order.
-    pub values: Vec<Value>,
-    /// Partition bucket the row belongs to in cold storage.
-    pub bucket: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +141,31 @@ impl HotStore {
             keys.push(values);
         }
 
+        self.write(dataset_id, table, rows, keys)
+    }
+
+    /// Inserts rows that are already coerced to their declared types; the
+    /// Parquet import path lands here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction cannot be committed.
+    pub fn insert_typed(
+        &self,
+        dataset_id: &str,
+        table: &TableSpec,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<IngestCounts, HotError> {
+        self.write(dataset_id, table, rows, Vec::new())
+    }
+
+    fn write(
+        &self,
+        dataset_id: &str,
+        table: &TableSpec,
+        rows: Vec<Vec<Value>>,
+        keys: Vec<Vec<Value>>,
+    ) -> Result<IngestCounts, HotError> {
         let connection = self.connection(dataset_id)?;
         let mut guard = lock(&connection)?;
         let transaction = guard.transaction()?;
@@ -243,6 +259,115 @@ impl HotStore {
         })
     }
 
+    /// Lists the buckets that hold rows past the cooling boundary, oldest
+    /// first. Each entry is the bucket key used in the cold tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub fn coolable_buckets(
+        &self,
+        dataset_id: &str,
+        table: &TableSpec,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, HotError> {
+        let width = cooling::key_length(table.granularity) as i64;
+        let time = format!("\"{}\"", table.time_column);
+        let connection = self.connection(dataset_id)?;
+        let guard = lock(&connection)?;
+        let mut statement = guard.prepare(&format!(
+            "SELECT substr({time}, 1, ?1) FROM \"{HOT_TABLE}\" WHERE \"_flush\" IS NULL AND {time} < ?2 GROUP BY 1 ORDER BY 1 ASC LIMIT ?3"
+        ))?;
+        let buckets = statement
+            .query_map(params![width, boundary, limit], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(buckets)
+    }
+
+    /// Claims every coolable row of one bucket for a pass and reports how many
+    /// rows that is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the claim cannot be written.
+    pub fn claim_bucket(
+        &self,
+        dataset_id: &str,
+        table: &TableSpec,
+        bucket: &str,
+        boundary: &str,
+        pass: i64,
+    ) -> Result<i64, HotError> {
+        let width = cooling::key_length(table.granularity) as i64;
+        let time = format!("\"{}\"", table.time_column);
+        let connection = self.connection(dataset_id)?;
+        let guard = lock(&connection)?;
+        let changed = guard.execute(
+            &format!(
+                "UPDATE \"{HOT_TABLE}\" SET \"_flush\" = ?1 WHERE \"_flush\" IS NULL AND {time} < ?2 AND substr({time}, 1, ?3) = ?4"
+            ),
+            params![pass, boundary, width, bucket],
+        )?;
+        Ok(changed as i64)
+    }
+
+    /// Inserts the rows of an existing cold partition into the hot table under
+    /// a pass, so a rewrite can merge them with the claimed rows. Rows that
+    /// already exist (the newly written ones) win; the partition copy only
+    /// fills the gaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be written.
+    pub fn merge_partition(
+        &self,
+        dataset_id: &str,
+        table: &TableSpec,
+        rows: &[Vec<Value>],
+        pass: i64,
+    ) -> Result<i64, HotError> {
+        let connection = self.connection(dataset_id)?;
+        let mut guard = lock(&connection)?;
+        let transaction = guard.transaction()?;
+        let names = table
+            .columns
+            .iter()
+            .map(|column| format!("\"{}\"", column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=table.columns.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key = table
+            .primary_key
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!(
+            "INSERT INTO \"{HOT_TABLE}\" (\"_flush\", {names}) VALUES ({placeholders}) ON CONFLICT ({key}) DO NOTHING"
+        );
+        let mut inserted = 0_i64;
+        {
+            let mut prepared = transaction.prepare(&statement)?;
+            for values in rows {
+                if values.len() != table.columns.len() {
+                    return Err(HotError::Invalid(
+                        "a merged row does not match the declared columns".to_owned(),
+                    ));
+                }
+                let mut parameters = Vec::with_capacity(values.len() + 1);
+                parameters.push(Value::Integer(pass).to_sql());
+                parameters.extend(values.iter().map(Value::to_sql));
+                inserted += prepared.execute(params_from_iter(parameters.iter()))? as i64;
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
     /// Counts rows of one table that crossed the cooling boundary.
     ///
     /// # Errors
@@ -299,31 +424,7 @@ impl HotStore {
             .map_err(HotError::Sqlite)
     }
 
-    /// Marks every coolable row of one table as claimed by a flush batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the claim cannot be written.
-    pub fn claim(
-        &self,
-        dataset_id: &str,
-        table: &TableSpec,
-        boundary: &str,
-        batch: i64,
-    ) -> Result<i64, HotError> {
-        let connection = self.connection(dataset_id)?;
-        let guard = lock(&connection)?;
-        let changed = guard.execute(
-            &format!(
-                "UPDATE \"{HOT_TABLE}\" SET \"_flush\" = ?1 WHERE \"_flush\" IS NULL AND \"{}\" < ?2",
-                table.time_column
-            ),
-            rusqlite::params![batch, boundary],
-        )?;
-        Ok(changed as i64)
-    }
-
-    /// Reads the rows claimed by one flush batch, grouped by cold partition.
+    /// Reads the rows claimed by one pass, oldest first.
     ///
     /// # Errors
     ///
@@ -332,8 +433,8 @@ impl HotStore {
         &self,
         dataset_id: &str,
         table: &TableSpec,
-        batch: i64,
-    ) -> Result<Vec<HotRow>, HotError> {
+        pass: i64,
+    ) -> Result<Vec<Vec<Value>>, HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         let names = table
@@ -348,57 +449,50 @@ impl HotStore {
             table.time_column
         );
         let mut prepared = guard.prepare(&statement)?;
-        let rows = prepared.query_map([batch], |row| read_row(row, table))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|values| {
-                let Value::Timestamp(timestamp) = &values[time_index] else {
-                    return Err(HotError::Invalid(
-                        "the hot table holds a row without a timestamp".to_owned(),
-                    ));
-                };
-                let bucket =
-                    cooling::bucket(table.granularity, timestamp).map_err(HotError::Invalid)?;
-                Ok(HotRow {
-                    values: values.clone(),
-                    bucket,
-                })
-            })
-            .collect()
+        let rows = prepared.query_map([pass], |row| read_row(row, table))?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        for values in &rows {
+            if !matches!(values.get(time_index), Some(Value::Timestamp(_))) {
+                return Err(HotError::Invalid(
+                    "the hot table holds a row without a timestamp".to_owned(),
+                ));
+            }
+        }
+        Ok(rows)
     }
 
-    /// Releases rows claimed by a batch that never reached cold storage.
+    /// Releases the rows one pass claimed, after it failed.
     ///
     /// # Errors
     ///
     /// Returns an error when the release cannot be written.
-    pub fn release(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
+    pub fn release(&self, dataset_id: &str, pass: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         guard.execute(
             &format!("UPDATE \"{HOT_TABLE}\" SET \"_flush\" = NULL WHERE \"_flush\" = ?1"),
-            [batch],
+            [pass],
         )?;
         Ok(())
     }
 
-    /// Drops claims left behind by batches that are already in cold storage.
+    /// Releases claims left behind by a pass that died mid-flight.
     ///
-    /// A claim only survives a committed batch when the process died between
-    /// recording the batch and deleting the claimed rows, so the rows are
-    /// already safe in cold storage and can go.
+    /// A rewrite is not atomic across partitions, so a stale claim does not mean
+    /// the rows reached cold storage. They go back to the unclaimed pool and the
+    /// next pass rewrites that bucket from scratch; rewriting is idempotent.
     ///
     /// # Errors
     ///
-    /// Returns an error when the cleanup cannot be written.
-    pub fn purge_stale_claims(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
+    /// Returns an error when the release cannot be written.
+    pub fn release_stale_claims(&self, dataset_id: &str, pass: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         guard.execute(
             &format!(
-                "DELETE FROM \"{HOT_TABLE}\" WHERE \"_flush\" IS NOT NULL AND \"_flush\" < ?1"
+                "UPDATE \"{HOT_TABLE}\" SET \"_flush\" = NULL WHERE \"_flush\" IS NOT NULL AND \"_flush\" != ?1"
             ),
-            [batch],
+            [pass],
         )?;
         Ok(())
     }
@@ -408,12 +502,12 @@ impl HotStore {
     /// # Errors
     ///
     /// Returns an error when the deletion cannot be written.
-    pub fn purge(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
+    pub fn purge(&self, dataset_id: &str, pass: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         guard.execute(
             &format!("DELETE FROM \"{HOT_TABLE}\" WHERE \"_flush\" = ?1"),
-            [batch],
+            [pass],
         )?;
         Ok(())
     }
@@ -550,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn claims_are_isolated_by_batch_and_releasable() {
+    fn claims_are_isolated_by_pass_and_releasable() {
         let (_state, store) = store();
         store
             .ingest(
@@ -563,13 +657,18 @@ mod tests {
         let table = klines();
         assert_eq!(
             store
-                .claim("demo", &table, "2026-10-01T00:00:00.000000Z", 3)
+                .claim_bucket(
+                    "demo",
+                    &table,
+                    "2026-09-01",
+                    "2026-10-01T00:00:00.000000Z",
+                    3
+                )
                 .expect("claim"),
             1
         );
         let claimed = store.claimed("demo", &table, 3).expect("claimed");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].bucket, "2026-09-01");
         store.release("demo", 3).expect("release");
         assert!(
             store
@@ -593,7 +692,13 @@ mod tests {
             )
             .expect("ingest");
         store
-            .claim("demo", &table, "2026-10-01T00:00:00.000000Z", 1)
+            .claim_bucket(
+                "demo",
+                &table,
+                "2026-09-01",
+                "2026-10-01T00:00:00.000000Z",
+                1,
+            )
             .expect("claim");
         store
             .ingest(

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use auth_mini_axum::{AuthMiniLayer, JwksCachePolicy};
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use cold::{ColdStore, S3ColdStore};
 use db::Database;
@@ -83,25 +83,45 @@ impl App {
             JwksCachePolicy::default(),
         )?;
         let cold: Arc<dyn ColdStore> = Arc::new(S3ColdStore::new(self.database.clone()));
-        spawn_sweeper(self.database.clone(), Arc::clone(&cold));
-        let app = web::router(self.database, self.resources, cold, auth);
+        let wake = Arc::new(Notify::new());
+        spawn_cooling(self.database.clone(), Arc::clone(&cold), Arc::clone(&wake));
+        let app = web::router(self.database, self.resources, cold, auth, wake);
         let listener = tokio::net::TcpListener::bind(address).await?;
         axum::serve(listener, app).await?;
         Ok(())
     }
 }
 
-// The sweeper is the only automatic mover of data: it advances every dataset's
-// cooling boundary and lets the pass do the rest. It never pushes a dataset that
-// still has a running pass or that failed moments ago.
-fn spawn_sweeper(database: Database, cold: Arc<dyn ColdStore>) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(COOLING_INTERVAL);
-        loop {
-            ticker.tick().await;
-            sweep_once(&database, cold.as_ref()).await;
-        }
-    });
+// Cooling gets its own OS thread and a single-threaded runtime: a pass does
+// blocking SQLite work and Parquet encoding, and the HTTP runtime has only two
+// workers on the production host.
+fn spawn_cooling(database: Database, cold: Arc<dyn ColdStore>, wake: Arc<Notify>) {
+    let spawned = std::thread::Builder::new()
+        .name("firmament-cooling".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("firmament: cooling runtime failed: {error}");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(COOLING_INTERVAL) => {}
+                        () = wake.notified() => {}
+                    }
+                    sweep_once(&database, cold.as_ref()).await;
+                }
+            });
+        });
+    if let Err(error) = spawned {
+        eprintln!("firmament: cooling thread failed: {error}");
+    }
 }
 
 async fn sweep_once(database: &Database, cold: &dyn ColdStore) {
@@ -146,10 +166,10 @@ async fn sweep_once(database: &Database, cold: &dyn ColdStore) {
         if coolable == 0 {
             continue;
         }
-        match flush::run_flush(database, cold, &dataset.id, "schedule").await {
+        match flush::run_pass(database, cold, &dataset.id, "schedule").await {
             Ok(report) => eprintln!(
-                "firmament: {} flushed batch {} ({} rows, {} files)",
-                dataset.id, report.batch, report.rows, report.files
+                "firmament: {} pass {} rewrote {} partitions ({} rows)",
+                dataset.id, report.pass, report.partitions, report.rows
             ),
             Err(message) => eprintln!("firmament: {} cooling failed: {message}", dataset.id),
         }

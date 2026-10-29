@@ -11,10 +11,10 @@
 //! midnight instead of a local one only shifts a few hours of rows between one
 //! cooling pass and the next, which does not change what the data means.
 
-use chrono::{DateTime, Datelike, Days, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{Granularity, parse_timestamp};
+use crate::schema::Granularity;
 
 /// How often the hot window rolls over and the previous period cools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -64,29 +64,24 @@ pub fn boundary(now: DateTime<Utc>, cadence: Cadence) -> DateTime<Utc> {
     start.and_time(NaiveTime::MIN).and_utc()
 }
 
-/// The partition bucket of an instant, as named in the cold tree.
+/// Width of the bucket key inside a normalised timestamp.
 ///
-/// Buckets are UTC, so `day=2026-10-01` is a UTC calendar day.
-///
-/// # Errors
-///
-/// Returns an error when the instant cannot be parsed.
-pub fn bucket(granularity: Granularity, instant: &str) -> Result<String, String> {
-    let moment =
-        parse_timestamp(instant).ok_or_else(|| format!("unparsable timestamp {instant}"))?;
-    let date = moment.date_naive();
-    Ok(match granularity {
-        Granularity::Hour => format!("{}T{:02}", date.format("%Y-%m-%d"), moment.hour()),
-        Granularity::Day => date.format("%Y-%m-%d").to_string(),
-        Granularity::Month => date.format("%Y-%m").to_string(),
-    })
+/// The key is simply the prefix of the UTC timestamp, which keeps the cold tree,
+/// the hot query and the manifest all naming a bucket the same way: `2026-10-01`
+/// for a day, `2026-10-01T13` for an hour and `2026-10` for a month.
+pub fn key_length(granularity: Granularity) -> usize {
+    match granularity {
+        Granularity::Hour => 13,
+        Granularity::Day => 10,
+        Granularity::Month => 7,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::{Cadence, boundary, bucket};
+    use super::{Cadence, boundary, key_length};
     use crate::schema::Granularity;
 
     fn at(raw: &str) -> DateTime<Utc> {
@@ -121,24 +116,20 @@ mod tests {
         );
     }
 
+    fn key(granularity: Granularity, instant: &str) -> String {
+        let normalized = crate::schema::normalize_timestamp(instant).expect("normalises");
+        normalized[..key_length(granularity)].to_owned()
+    }
+
     #[test]
     fn partitions_are_cut_in_utc() {
         let instant = "2026-09-30T18:00:00.000000Z";
-        assert_eq!(
-            bucket(Granularity::Day, instant).expect("bucket"),
-            "2026-09-30"
-        );
-        assert_eq!(
-            bucket(Granularity::Hour, instant).expect("bucket"),
-            "2026-09-30T18"
-        );
-        assert_eq!(
-            bucket(Granularity::Month, instant).expect("bucket"),
-            "2026-09"
-        );
+        assert_eq!(key(Granularity::Day, instant), "2026-09-30");
+        assert_eq!(key(Granularity::Hour, instant), "2026-09-30T18");
+        assert_eq!(key(Granularity::Month, instant), "2026-09");
         // An offset is normalised before the bucket is cut, not truncated.
         assert_eq!(
-            bucket(Granularity::Day, "2026-10-01T02:00:00+08:00").expect("bucket"),
+            key(Granularity::Day, "2026-10-01T02:00:00+08:00"),
             "2026-09-30"
         );
     }

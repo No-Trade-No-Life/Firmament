@@ -19,9 +19,10 @@ use crate::crypto::{Cipher, CipherError};
 use crate::hot::HotStore;
 use crate::schema::{self, TableSpec};
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
-/// One dataset: one declared table, its cooling cadence and a cold catalog.
+/// One dataset: one declared table, its cooling cadence and its cold
+/// partitions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Dataset {
     /// Slug identifying the dataset.
@@ -32,25 +33,28 @@ pub struct Dataset {
     pub description: String,
     /// How often the hot window rolls over.
     pub cadence: Cadence,
-    /// Sequence number of the last committed flush batch.
-    pub last_batch: i64,
+    /// Revision of the newest cold partition; also the mirror cursor.
+    pub last_revision: i64,
     /// Creation timestamp.
     pub created_at: i64,
     /// The one table the dataset declares.
     pub table: TableSpec,
 }
 
-/// One immutable Parquet file in the cold tree.
+/// One cold partition: every row of one bucket in a single Parquet object.
+///
+/// Partitions are rewritten in place when their bucket changes; the revision
+/// says which write a mirror has already seen.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ColdFile {
     /// Owning dataset.
     pub dataset_id: String,
-    /// Flush batch that produced the file.
-    pub batch: i64,
+    /// Revision of the current content; a fresh value on every rewrite.
+    pub revision: i64,
     /// Dataset-relative object path, also the local mirror path.
     pub path: String,
-    /// Partition key (`day=2026-10-01`).
-    pub partition: String,
+    /// Bucket this partition holds (`2026-10-01`, `2026-10-01T13`, `2026-10`).
+    pub bucket: String,
     /// Rows in the file.
     pub rows: i64,
     /// Object size in bytes.
@@ -68,8 +72,8 @@ pub struct ColdFile {
 /// Cold storage totals of a dataset.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ColdSummary {
-    /// Files catalogued for the dataset.
-    pub files: i64,
+    /// Partitions catalogued for the dataset.
+    pub partitions: i64,
     /// Bytes catalogued for the dataset.
     pub bytes: u64,
     /// Oldest timestamp in cold storage.
@@ -85,14 +89,14 @@ pub struct Flush {
     pub id: String,
     /// Owning dataset.
     pub dataset_id: String,
-    /// Batch sequence number, shared with the cold files it produced.
-    pub batch: i64,
-    /// What started it: `schedule`, `manual` or `backfill`.
+    /// Pass number, shared by every partition this pass rewrote.
+    pub pass: i64,
+    /// What started it: `schedule` or `manual`.
     pub trigger: String,
     /// `running`, `completed` or `failed`.
     pub status: String,
-    /// Files written.
-    pub files: i64,
+    /// Partitions rewritten.
+    pub partitions: i64,
     /// Rows written.
     pub rows: i64,
     /// Bytes written.
@@ -116,8 +120,8 @@ pub struct Syncer {
     pub name: String,
     /// Mirrored dataset.
     pub dataset_id: String,
-    /// Last flush batch this mirror saw.
-    pub last_batch: i64,
+    /// Highest partition revision this mirror saw.
+    pub last_revision: i64,
     /// Creation timestamp.
     pub created_at: i64,
     /// Last successful mirror timestamp.
@@ -265,29 +269,29 @@ impl Database {
                 description TEXT NOT NULL,
                 spec TEXT NOT NULL,
                 cadence TEXT NOT NULL,
-                last_batch INTEGER NOT NULL DEFAULT 0,
+                last_revision INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS flushes (
                 id TEXT PRIMARY KEY NOT NULL,
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                batch INTEGER NOT NULL,
+                pass INTEGER NOT NULL,
                 trigger TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
-                files INTEGER NOT NULL DEFAULT 0,
+                partitions INTEGER NOT NULL DEFAULT 0,
                 rows INTEGER NOT NULL DEFAULT 0,
                 bytes INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 finished_at INTEGER,
-                UNIQUE(dataset_id, batch)
+                UNIQUE(dataset_id, pass)
             );
-            CREATE INDEX IF NOT EXISTS flushes_dataset_id_idx ON flushes(dataset_id, batch DESC);
+            CREATE INDEX IF NOT EXISTS flushes_dataset_id_idx ON flushes(dataset_id, pass DESC);
             CREATE TABLE IF NOT EXISTS cold_files (
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                batch INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
                 path TEXT NOT NULL,
-                partition TEXT NOT NULL,
+                bucket TEXT NOT NULL,
                 rows INTEGER NOT NULL,
                 bytes INTEGER NOT NULL,
                 sha256 TEXT NOT NULL,
@@ -296,13 +300,21 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (dataset_id, path)
             );
-            CREATE INDEX IF NOT EXISTS cold_files_batch_idx ON cold_files(dataset_id, batch);
+            CREATE INDEX IF NOT EXISTS cold_files_revision_idx ON cold_files(dataset_id, revision);
+            CREATE TABLE IF NOT EXISTS imports (
+                id TEXT PRIMARY KEY NOT NULL,
+                dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                sha256 TEXT NOT NULL,
+                rows INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(dataset_id, sha256)
+            );
             CREATE TABLE IF NOT EXISTS syncers (
                 id TEXT PRIMARY KEY NOT NULL,
                 owner_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                last_batch INTEGER NOT NULL DEFAULT 0,
+                last_revision INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_synced_at INTEGER
             );
@@ -400,7 +412,7 @@ impl Database {
         })?;
         let created_at = Utc::now().timestamp();
         let inserted = self.connection()?.execute(
-            "INSERT INTO datasets(id, name, description, spec, cadence, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO datasets(id, name, description, spec, cadence, last_revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(id) DO NOTHING",
             params![id, name, description, spec, cadence.as_str(), created_at],
         )?;
         if inserted == 0 {
@@ -419,7 +431,7 @@ impl Database {
             name: name.to_owned(),
             description: description.to_owned(),
             cadence,
-            last_batch: 0,
+            last_revision: 0,
             created_at,
             table: table.clone(),
         })
@@ -428,7 +440,7 @@ impl Database {
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, name, description, spec, cadence, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
+            "SELECT id, name, description, spec, cadence, last_revision, created_at FROM datasets ORDER BY created_at ASC, id ASC",
         )?;
         let datasets = statement
             .query_map([], dataset_from_row)?
@@ -439,7 +451,7 @@ impl Database {
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, name, description, spec, cadence, last_batch, created_at FROM datasets WHERE id = ?1",
+                "SELECT id, name, description, spec, cadence, last_revision, created_at FROM datasets WHERE id = ?1",
                 [id],
                 dataset_from_row,
             )
@@ -447,42 +459,38 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
-    /// Starts a cooling pass, allocating the next batch number.
+    /// Starts a cooling pass, allocating the next pass number.
     ///
     /// # Errors
     ///
     /// Returns an error when another pass on the same dataset is still running.
-    pub fn begin_flush(&self, dataset_id: &str, trigger: &str) -> Result<Flush, DatabaseError> {
+    pub fn begin_pass(&self, dataset_id: &str, trigger: &str) -> Result<Flush, DatabaseError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let running: Option<i64> = transaction
             .query_row(
-                "SELECT batch FROM flushes WHERE dataset_id = ?1 AND status = 'running' LIMIT 1",
+                "SELECT pass FROM flushes WHERE dataset_id = ?1 AND status = 'running' LIMIT 1",
                 [dataset_id],
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(batch) = running {
+        if let Some(pass) = running {
             return Err(DatabaseError::Conflict(format!(
-                "batch {batch} is still running"
+                "pass {pass} is still running"
             )));
         }
-        transaction.execute(
-            "UPDATE datasets SET last_batch = last_batch + 1 WHERE id = ?1",
-            [dataset_id],
-        )?;
-        let batch: i64 = transaction.query_row(
-            "SELECT last_batch FROM datasets WHERE id = ?1",
+        let pass: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(pass), 0) + 1 FROM flushes WHERE dataset_id = ?1",
             [dataset_id],
             |row| row.get(0),
         )?;
         let flush = Flush {
             id: Uuid::new_v4().to_string(),
             dataset_id: dataset_id.to_owned(),
-            batch,
+            pass,
             trigger: trigger.to_owned(),
             status: "running".to_owned(),
-            files: 0,
+            partitions: 0,
             rows: 0,
             bytes: 0,
             message: String::new(),
@@ -490,45 +498,50 @@ impl Database {
             finished_at: None,
         };
         transaction.execute(
-            "INSERT INTO flushes(id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at) VALUES (?1, ?2, ?3, ?4, 'running', 0, 0, 0, '', ?5)",
-            params![flush.id, flush.dataset_id, flush.batch, flush.trigger, flush.created_at],
+            "INSERT INTO flushes(id, dataset_id, pass, trigger, status, partitions, rows, bytes, message, created_at) VALUES (?1, ?2, ?3, ?4, 'running', 0, 0, 0, '', ?5)",
+            params![flush.id, flush.dataset_id, flush.pass, flush.trigger, flush.created_at],
         )?;
         transaction.commit()?;
         Ok(flush)
     }
 
-    /// Records the files of a finished batch; this is the commit point of a
-    /// cooling pass.
+    /// Allocates the next partition revision of a dataset.
     ///
     /// # Errors
     ///
-    /// Returns an error when the catalog rows cannot be written.
-    pub fn record_batch(
-        &self,
-        dataset_id: &str,
-        batch: i64,
-        files: &[ColdFile],
-    ) -> Result<(), DatabaseError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        for file in files {
-            transaction.execute(
-                "INSERT INTO cold_files(dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(dataset_id, path) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes, sha256 = excluded.sha256, min_time = excluded.min_time, max_time = excluded.max_time",
-                params![
-                    dataset_id,
-                    batch,
-                    file.path,
-                    file.partition,
-                    file.rows,
-                    file.bytes as i64,
-                    file.sha256,
-                    file.min_time,
-                    file.max_time,
-                    file.created_at
-                ],
-            )?;
-        }
-        transaction.commit()?;
+    /// Returns an error when the counter cannot be advanced.
+    pub fn next_revision(&self, dataset_id: &str) -> Result<i64, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "UPDATE datasets SET last_revision = last_revision + 1 WHERE id = ?1 RETURNING last_revision",
+                [dataset_id],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records one rewritten partition; this is the commit point of a cooling
+    /// pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog row cannot be written.
+    pub fn record_partition(&self, dataset_id: &str, file: &ColdFile) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "INSERT INTO cold_files(dataset_id, revision, path, bucket, rows, bytes, sha256, min_time, max_time, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(dataset_id, path) DO UPDATE SET revision = excluded.revision, bucket = excluded.bucket, rows = excluded.rows, bytes = excluded.bytes, sha256 = excluded.sha256, min_time = excluded.min_time, max_time = excluded.max_time, created_at = excluded.created_at",
+            params![
+                dataset_id,
+                file.revision,
+                file.path,
+                file.bucket,
+                file.rows,
+                file.bytes as i64,
+                file.sha256,
+                file.min_time,
+                file.max_time,
+                file.created_at
+            ],
+        )?;
         Ok(())
     }
 
@@ -537,18 +550,18 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when the row cannot be updated.
-    pub fn finish_flush(
+    pub fn finish_pass(
         &self,
         id: &str,
         status: &str,
-        files: i64,
+        partitions: i64,
         rows: i64,
         bytes: i64,
         message: &str,
     ) -> Result<(), DatabaseError> {
         self.connection()?.execute(
-            "UPDATE flushes SET status = ?2, files = ?3, rows = ?4, bytes = ?5, message = ?6, finished_at = ?7 WHERE id = ?1",
-            params![id, status, files, rows, bytes, message, Utc::now().timestamp()],
+            "UPDATE flushes SET status = ?2, partitions = ?3, rows = ?4, bytes = ?5, message = ?6, finished_at = ?7 WHERE id = ?1",
+            params![id, status, partitions, rows, bytes, message, Utc::now().timestamp()],
         )?;
         Ok(())
     }
@@ -556,7 +569,7 @@ impl Database {
     pub fn latest_flush(&self, dataset_id: &str) -> Result<Option<Flush>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY batch DESC LIMIT 1",
+                "SELECT id, dataset_id, pass, trigger, status, partitions, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY pass DESC LIMIT 1",
                 [dataset_id],
                 flush_from_row,
             )
@@ -567,7 +580,7 @@ impl Database {
     pub fn list_flushes(&self, dataset_id: &str, limit: i64) -> Result<Vec<Flush>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, dataset_id, batch, trigger, status, files, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY batch DESC LIMIT ?2",
+            "SELECT id, dataset_id, pass, trigger, status, partitions, rows, bytes, message, created_at, finished_at FROM flushes WHERE dataset_id = ?1 ORDER BY pass DESC LIMIT ?2",
         )?;
         statement
             .query_map(params![dataset_id, limit], flush_from_row)?
@@ -575,7 +588,8 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
-    /// Lists cold files, optionally only those newer than a mirrored batch.
+    /// Lists cold partitions, optionally only those rewritten since a mirror's
+    /// last revision.
     ///
     /// # Errors
     ///
@@ -583,14 +597,14 @@ impl Database {
     pub fn cold_files(
         &self,
         dataset_id: &str,
-        since_batch: i64,
+        since_revision: i64,
     ) -> Result<Vec<ColdFile>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND batch > ?2 ORDER BY batch ASC, path ASC",
+            "SELECT dataset_id, revision, path, bucket, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND revision > ?2 ORDER BY revision ASC",
         )?;
         statement
-            .query_map(params![dataset_id, since_batch], cold_file_from_row)?
+            .query_map(params![dataset_id, since_revision], cold_file_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
     }
@@ -607,7 +621,7 @@ impl Database {
     ) -> Result<Option<ColdFile>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
+                "SELECT dataset_id, revision, path, bucket, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
                 params![dataset_id, path],
                 cold_file_from_row,
             )
@@ -617,7 +631,7 @@ impl Database {
 
     pub fn list_syncers(&self, owner_id: Option<&str>) -> Result<Vec<Syncer>, DatabaseError> {
         let connection = self.connection()?;
-        let columns = "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers";
+        let columns = "SELECT id, owner_id, name, dataset_id, last_revision, created_at, last_synced_at FROM syncers";
         match owner_id {
             Some(owner_id) => {
                 let mut statement = connection.prepare(&format!(
@@ -642,7 +656,7 @@ impl Database {
     pub fn get_syncer(&self, id: &str) -> Result<Option<Syncer>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers WHERE id = ?1",
+                "SELECT id, owner_id, name, dataset_id, last_revision, created_at, last_synced_at FROM syncers WHERE id = ?1",
                 [id],
                 syncer_from_row,
             )
@@ -661,13 +675,13 @@ impl Database {
             owner_id: owner_id.to_owned(),
             name: name.to_owned(),
             dataset_id: dataset_id.to_owned(),
-            last_batch: 0,
+            last_revision: 0,
             created_at: Utc::now().timestamp(),
             last_synced_at: None,
         };
         self.connection()?.execute(
-            "INSERT INTO syncers(id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.last_batch, syncer.created_at],
+            "INSERT INTO syncers(id, owner_id, name, dataset_id, last_revision, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.last_revision, syncer.created_at],
         )?;
         Ok(syncer)
     }
@@ -679,7 +693,7 @@ impl Database {
         Ok(changed == 1)
     }
 
-    /// Records a mirrored batch on a syncer.
+    /// Records a mirrored revision on a syncer.
     ///
     /// # Errors
     ///
@@ -688,11 +702,11 @@ impl Database {
         &self,
         id: &str,
         timestamp: i64,
-        batch: i64,
+        revision: i64,
     ) -> Result<Option<Syncer>, DatabaseError> {
         self.connection()?.execute(
-            "UPDATE syncers SET last_synced_at = ?2, last_batch = MAX(last_batch, ?3) WHERE id = ?1",
-            params![id, timestamp, batch],
+            "UPDATE syncers SET last_synced_at = ?2, last_revision = MAX(last_revision, ?3) WHERE id = ?1",
+            params![id, timestamp, revision],
         )?;
         self.get_syncer(id)
     }
@@ -881,6 +895,44 @@ impl Database {
         Ok(())
     }
 
+    /// Rows carried by an import that was already applied, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger cannot be read.
+    pub fn imported_rows(
+        &self,
+        dataset_id: &str,
+        sha256: &str,
+    ) -> Result<Option<i64>, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT rows FROM imports WHERE dataset_id = ?1 AND sha256 = ?2",
+                params![dataset_id, sha256],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records one applied Parquet import so a replay is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger cannot be written.
+    pub fn record_import(
+        &self,
+        dataset_id: &str,
+        sha256: &str,
+        rows: i64,
+    ) -> Result<(), DatabaseError> {
+        self.connection()?.execute(
+            "INSERT INTO imports(id, dataset_id, sha256, rows, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(dataset_id, sha256) DO NOTHING",
+            params![Uuid::new_v4().to_string(), dataset_id, sha256, rows, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_ingest_events(&self, limit: i64) -> Result<Vec<IngestEvent>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -904,7 +956,7 @@ impl Database {
                 [dataset_id],
                 |row| {
                     Ok(ColdSummary {
-                        files: row.get(0)?,
+                        partitions: row.get(0)?,
                         bytes: row.get::<_, i64>(1)?.max(0) as u64,
                         earliest_time: row.get(2)?,
                         latest_time: row.get(3)?,
@@ -956,7 +1008,7 @@ fn dataset_from_row(row: &Row<'_>) -> rusqlite::Result<Dataset> {
                 Box::new(std::io::Error::other(format!("unknown cadence {cadence}"))),
             )
         })?,
-        last_batch: row.get(5)?,
+        last_revision: row.get(5)?,
         created_at: row.get(6)?,
     })
 }
@@ -967,7 +1019,7 @@ fn syncer_from_row(row: &Row<'_>) -> rusqlite::Result<Syncer> {
         owner_id: row.get(1)?,
         name: row.get(2)?,
         dataset_id: row.get(3)?,
-        last_batch: row.get(4)?,
+        last_revision: row.get(4)?,
         created_at: row.get(5)?,
         last_synced_at: row.get(6)?,
     })
@@ -998,10 +1050,10 @@ fn flush_from_row(row: &Row<'_>) -> rusqlite::Result<Flush> {
     Ok(Flush {
         id: row.get(0)?,
         dataset_id: row.get(1)?,
-        batch: row.get(2)?,
+        pass: row.get(2)?,
         trigger: row.get(3)?,
         status: row.get(4)?,
-        files: row.get(5)?,
+        partitions: row.get(5)?,
         rows: row.get(6)?,
         bytes: row.get(7)?,
         message: row.get(8)?,
@@ -1013,9 +1065,9 @@ fn flush_from_row(row: &Row<'_>) -> rusqlite::Result<Flush> {
 fn cold_file_from_row(row: &Row<'_>) -> rusqlite::Result<ColdFile> {
     Ok(ColdFile {
         dataset_id: row.get(0)?,
-        batch: row.get(1)?,
+        revision: row.get(1)?,
         path: row.get(2)?,
-        partition: row.get(3)?,
+        bucket: row.get(3)?,
         rows: row.get(4)?,
         bytes: row.get::<_, i64>(5)?.max(0) as u64,
         sha256: row.get(6)?,
@@ -1042,6 +1094,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             "DROP TABLE IF EXISTS archive_jobs;
              DROP TABLE IF EXISTS publish_events;
              DROP TABLE IF EXISTS cold_files;
+             DROP TABLE IF EXISTS imports;
              DROP TABLE IF EXISTS syncers;
              DROP TABLE IF EXISTS datasets;",
         )?;
@@ -1110,7 +1163,7 @@ mod tests {
         let dataset = database
             .create_dataset("bars", "Bars", "test", daily(), &bars())
             .expect("dataset creates");
-        assert_eq!(dataset.last_batch, 0);
+        assert_eq!(dataset.last_revision, 0);
         assert!(
             database
                 .create_dataset("bars", "Bars", "test", daily(), &bars())
@@ -1123,31 +1176,31 @@ mod tests {
     }
 
     #[test]
-    fn batch_numbers_are_allocated_per_dataset_and_serialized() {
+    fn passes_are_allocated_per_dataset_and_serialized() {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
             .create_dataset("bars", "Bars", "", daily(), &bars())
             .expect("dataset creates");
 
-        let first = database.begin_flush("bars", "schedule").expect("first");
-        assert_eq!(first.batch, 1);
+        let first = database.begin_pass("bars", "schedule").expect("first");
+        assert_eq!(first.pass, 1);
         assert!(
-            database.begin_flush("bars", "manual").is_err(),
+            database.begin_pass("bars", "manual").is_err(),
             "one running pass per dataset"
         );
         database
-            .finish_flush(&first.id, "completed", 1, 10, 100, "")
+            .finish_pass(&first.id, "completed", 1, 10, 100, "")
             .expect("finish");
-        let second = database.begin_flush("bars", "manual").expect("second");
-        assert_eq!(second.batch, 2);
+        let second = database.begin_pass("bars", "manual").expect("second");
+        assert_eq!(second.pass, 2);
 
         let flushes = database.list_flushes("bars", 10).expect("list");
         assert_eq!(flushes.len(), 2);
-        assert_eq!(flushes[0].batch, 2);
+        assert_eq!(flushes[0].pass, 2);
         assert_eq!(flushes[0].status, "running");
         database
-            .finish_flush(&second.id, "failed", 0, 0, 0, "boom")
+            .finish_pass(&second.id, "failed", 0, 0, 0, "boom")
             .expect("fail");
         assert_eq!(
             database
@@ -1160,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_supports_incremental_reads() {
+    fn partitions_support_incremental_reads() {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
@@ -1168,9 +1221,9 @@ mod tests {
             .expect("dataset creates");
         let file = super::ColdFile {
             dataset_id: "bars".to_owned(),
-            batch: 1,
-            path: "day=2026-10-01/000001-0000.parquet".to_owned(),
-            partition: "day=2026-10-01".to_owned(),
+            revision: 1,
+            path: "2026-10-01.parquet".to_owned(),
+            bucket: "2026-10-01".to_owned(),
             rows: 3,
             bytes: 42,
             sha256: "abc".to_owned(),
@@ -1178,9 +1231,7 @@ mod tests {
             max_time: "2026-10-01T00:02:00.000000Z".to_owned(),
             created_at: 1,
         };
-        database
-            .record_batch("bars", 1, std::slice::from_ref(&file))
-            .expect("records");
+        database.record_partition("bars", &file).expect("records");
 
         assert_eq!(database.cold_files("bars", 0).expect("all").len(), 1);
         assert!(
@@ -1192,7 +1243,7 @@ mod tests {
         );
         assert_eq!(
             database
-                .cold_file("bars", "day=2026-10-01/000001-0000.parquet")
+                .cold_file("bars", "2026-10-01.parquet")
                 .expect("lookup")
                 .expect("exists")
                 .rows,
