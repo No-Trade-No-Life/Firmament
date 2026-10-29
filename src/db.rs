@@ -205,10 +205,51 @@ pub struct IngestEvent {
 pub const META_COLD_BUCKET: &str = "cold_bucket";
 /// Cold storage region key.
 pub const META_COLD_REGION: &str = "cold_region";
+/// Custom S3-compatible endpoint; empty means AWS S3.
+pub const META_COLD_ENDPOINT: &str = "cold_endpoint";
+/// Static access key id for an S3-compatible endpoint.
+pub const META_COLD_ACCESS_KEY: &str = "cold_access_key";
+/// Encrypted static secret key for an S3-compatible endpoint.
+pub const META_COLD_SECRET: &str = "cold_secret_ciphertext";
 /// Default cold bucket.
 pub const DEFAULT_COLD_BUCKET: &str = "firmament-ntnl";
 /// Default cold region.
 pub const DEFAULT_COLD_REGION: &str = "ap-northeast-1";
+
+/// Where the cold tree lives.
+///
+/// `endpoint` + static keys describe an S3-compatible store such as Cloudflare
+/// R2; leaving them empty keeps the AWS SDK's own credential chain, which is how
+/// the same binary runs on an instance role.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ColdSettings {
+    /// Bucket name.
+    pub bucket: String,
+    /// Region; S3-compatible stores accept their own convention (`auto` on R2).
+    pub region: String,
+    /// S3-compatible endpoint, e.g. `https://<account>.r2.cloudflarestorage.com`.
+    pub endpoint: Option<String>,
+    /// Static access key id.
+    pub access_key_id: Option<String>,
+    /// Static secret key; only kept decrypted in memory.
+    pub secret_access_key: Option<String>,
+}
+
+impl std::fmt::Debug for ColdSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ColdSettings")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -809,6 +850,63 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    /// Reads the cold storage coordinates, decrypting the static secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the settings cannot be read or the secret cannot be
+    /// decrypted.
+    pub fn cold_settings(&self) -> Result<ColdSettings, DatabaseError> {
+        let secret_access_key = match self.meta_value(META_COLD_SECRET)? {
+            Some(ciphertext) => Some(self.cipher.decrypt(&ciphertext)?),
+            None => None,
+        };
+        Ok(ColdSettings {
+            bucket: self
+                .meta_value(META_COLD_BUCKET)?
+                .unwrap_or_else(|| DEFAULT_COLD_BUCKET.to_owned()),
+            region: self
+                .meta_value(META_COLD_REGION)?
+                .unwrap_or_else(|| DEFAULT_COLD_REGION.to_owned()),
+            endpoint: self.meta_value(META_COLD_ENDPOINT)?,
+            access_key_id: self.meta_value(META_COLD_ACCESS_KEY)?,
+            secret_access_key,
+        })
+    }
+
+    /// Stores the cold storage coordinates, encrypting the static secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the settings cannot be written or the secret cannot
+    /// be encrypted.
+    pub fn save_cold_settings(&self, settings: &ColdSettings) -> Result<(), DatabaseError> {
+        self.put_meta_value(META_COLD_BUCKET, &settings.bucket)?;
+        self.put_meta_value(META_COLD_REGION, &settings.region)?;
+        self.put_optional_meta(META_COLD_ENDPOINT, settings.endpoint.as_deref())?;
+        self.put_optional_meta(META_COLD_ACCESS_KEY, settings.access_key_id.as_deref())?;
+        match settings.secret_access_key.as_deref() {
+            Some(secret) => {
+                self.put_meta_value(META_COLD_SECRET, &self.cipher.encrypt(secret)?)?;
+            }
+            None => self.delete_meta_value(META_COLD_SECRET)?,
+        }
+        Ok(())
+    }
+
+    fn put_optional_meta(&self, key: &str, value: Option<&str>) -> Result<(), DatabaseError> {
+        match value {
+            Some(value) => self.put_meta_value(key, value),
+            None => self.delete_meta_value(key),
+        }
+    }
+
+    fn delete_meta_value(&self, key: &str) -> Result<(), DatabaseError> {
+        self.connection()?
+            .execute("DELETE FROM app_meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn put_meta_value(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
         self.connection()?.execute(
             "INSERT INTO app_meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1272,6 +1370,44 @@ mod tests {
                 .is_none(),
             "only catalogued paths resolve"
         );
+    }
+
+    #[test]
+    fn cold_settings_round_trip_and_keep_the_secret_encrypted() {
+        let state = TempDir::new().expect("state directory");
+        let database = Database::open(state.path()).expect("database opens");
+        let defaults = database.cold_settings().expect("defaults");
+        assert_eq!(defaults.bucket, super::DEFAULT_COLD_BUCKET);
+        assert_eq!(defaults.region, super::DEFAULT_COLD_REGION);
+        assert_eq!(defaults.endpoint, None);
+        assert_eq!(defaults.secret_access_key, None);
+
+        let settings = super::ColdSettings {
+            bucket: "firmament-cold".to_owned(),
+            region: "auto".to_owned(),
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_owned()),
+            access_key_id: Some("access".to_owned()),
+            secret_access_key: Some("super-secret".to_owned()),
+        };
+        database.save_cold_settings(&settings).expect("saves");
+        assert_eq!(database.cold_settings().expect("reads"), settings);
+
+        let stored = database
+            .meta_value(super::META_COLD_SECRET)
+            .expect("meta")
+            .expect("secret");
+        assert_ne!(stored, "super-secret", "the secret is stored encrypted");
+
+        database
+            .save_cold_settings(&super::ColdSettings {
+                secret_access_key: None,
+                access_key_id: None,
+                ..settings
+            })
+            .expect("clears");
+        let cleared = database.cold_settings().expect("reads");
+        assert_eq!(cleared.access_key_id, None);
+        assert_eq!(cleared.secret_access_key, None);
     }
 
     #[test]

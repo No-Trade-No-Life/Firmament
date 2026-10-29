@@ -26,7 +26,7 @@ Firmament 是一台**冷却器**：每个数据集就是一张表，一份 schem
 - **冷却线**：当前周期的 UTC 起点 —— `daily` → 今天 00:00Z，`weekly` → 本周一 00:00Z，
   `monthly` → 本月 1 日 00:00Z。早于它的行才可冷却。
 - **冷却不清空热库**：只删掉已导出成冷库的那部分行，当前周期永远留在可写的热库里。
-- **冷库**：一个桶一个 Parquet 对象的扁平树，写在 S3 上，可脱离应用独立读取。
+- **冷库**：一个桶一个 Parquet 对象的扁平树，写在任意 S3 兼容存储上，可脱离应用独立读取。
 - **分区粒度与冷却节奏正交**：每天冷却一次的数据也可以按小时或按月切分区。
 
 ## 写入
@@ -93,6 +93,26 @@ datasets/{dataset}/2026-10.parquet           # 月
 一次大回填不会把一轮冷却拖成几十分钟。崩溃恢复靠"释放认领"而不是删除：上一轮认领过的行
 回到未认领状态，下一轮把那个桶从头重写一遍，重写是幂等的。
 
+### 存储后端
+
+冷库走 S3 API，在「系统资源」页切换接法：
+
+| 接法 | 端点 | 凭证 |
+|---|---|---|
+| AWS S3 | 留空 | 实例角色 / 环境变量（SDK 默认链） |
+| Cloudflare R2 或其它兼容存储 | `https://<account>.r2.cloudflarestorage.com` | Access Key ID + Secret Access Key |
+
+R2 的填法：
+
+- 区域填 `auto`（R2 的约定，SDK 需要一个值）。
+- 端点填账号级 S3 端点；填了端点就强制 path-style，并把 SDK 的校验和降为"仅必要时"，
+  否则 R2 会拒绝 SDK 默认附加的 `x-amz-checksum-*`。
+- R2 API Token 只对授权的桶有效，Firmament 需要 **Object Read & Write**。
+
+凭证用 AES-256-GCM 存在控制面（密钥 `~/.firmament/credential.key`），接口只回 `has_secret`，
+不回明文。**换桶不会搬数据**：切换前要先把旧桶的对象拷到新桶，或重新导入对应分区；否则
+那一轮冷却会因为"分区登记了却读不到对象"而失败——这是刻意的不变量，不会拿热库覆盖历史。
+
 ## 同步（镜像）
 
 `GET /api/v1/datasets/{id}/manifest?since=<revision>` 返回修订号大于该值的分区
@@ -152,8 +172,8 @@ cargo test --all-targets --all-features --locked
 cargo run
 ```
 
-服务监听 `127.0.0.1:8080`。冷却需要 S3 权限：实例通过 IAM instance profile 获得冷库桶的
-读写权限，桶与区域在「系统资源」页配置。
+服务监听 `127.0.0.1:8080`。冷却需要 S3 权限：默认用实例的 IAM instance profile；
+填了 S3 端点与静态密钥就改用那套凭证（R2 等）。桶、区域、端点都在「系统资源」页配置。
 
 ## Logo
 

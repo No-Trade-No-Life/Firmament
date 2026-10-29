@@ -104,6 +104,9 @@ export type LinkitStatus = {
 export type ColdSettings = {
   bucket: string
   region: string
+  endpoint: string | null
+  access_key_id: string | null
+  has_secret: boolean
 }
 
 export type WriteToken = {
