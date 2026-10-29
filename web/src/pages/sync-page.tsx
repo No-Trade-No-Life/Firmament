@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { FolderOpenIcon, PlusIcon, RefreshCcwIcon, Trash2Icon } from "lucide-react"
+import { PlusIcon, RefreshCcwIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -15,15 +15,14 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { request, requestBytes, type AuthSdk } from "../lib/api"
-import { formatTimeAgo, showError } from "../lib/format"
+import { formatTime, showError } from "../lib/format"
 import type { Copy } from "../lib/i18n"
-import type { Dataset, DatasetManifest, Syncer } from "../lib/types"
+import type { DatasetView, Manifest, Syncer } from "../lib/types"
 import {
   ensurePermission,
   loadDirectoryHandle,
@@ -35,27 +34,40 @@ import {
   type SyncProgress,
 } from "../lib/sync"
 
+const ALL_TABLES = "__all__"
+
 export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t: Copy }) {
   const queryClient = useQueryClient()
   const syncers = useQuery({ queryKey: ["syncers"], queryFn: () => request<Syncer[]>("/api/v1/syncers", auth) })
-  const datasets = useQuery({ queryKey: ["datasets"], queryFn: () => request<Dataset[]>("/api/v1/datasets", auth) })
+  const datasets = useQuery({ queryKey: ["datasets"], queryFn: () => request<DatasetView[]>("/api/v1/datasets", auth) })
   const [name, setName] = useState("")
   const [datasetId, setDatasetId] = useState("")
-  const [subdir, setSubdir] = useState("")
+  const [tableName, setTableName] = useState(ALL_TABLES)
   const [progress, setProgress] = useState<Record<string, SyncProgress>>({})
   const [busy, setBusy] = useState<string | null>(null)
   const [removing, setRemoving] = useState<Syncer | null>(null)
   const supported = supportsDirectorySync()
   const list = syncers.data ?? []
+  const selected = (datasets.data ?? []).find((dataset) => dataset.id === datasetId)
 
   const create = useMutation({
-    mutationFn: () => request<Syncer>("/api/v1/syncers", auth, { method: "POST", body: JSON.stringify({ name, dataset_id: datasetId, subdir }) }),
-    onSuccess: () => { setName(""); setSubdir(""); void queryClient.invalidateQueries({ queryKey: ["syncers"] }) },
+    mutationFn: () => request<Syncer>("/api/v1/syncers", auth, {
+      method: "POST",
+      body: JSON.stringify({ name, dataset_id: datasetId, table_name: tableName === ALL_TABLES ? null : tableName }),
+    }),
+    onSuccess: () => {
+      setName("")
+      setTableName(ALL_TABLES)
+      void queryClient.invalidateQueries({ queryKey: ["syncers"] })
+    },
     onError: showError,
   })
   const remove = useMutation({
     mutationFn: (syncer: Syncer) => request<void>(`/api/v1/syncers/${syncer.id}`, auth, { method: "DELETE" }),
-    onSuccess: () => { setRemoving(null); void queryClient.invalidateQueries({ queryKey: ["syncers"] }) },
+    onSuccess: () => {
+      setRemoving(null)
+      void queryClient.invalidateQueries({ queryKey: ["syncers"] })
+    },
     onError: showError,
   })
 
@@ -70,16 +82,20 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
         if (!(await ensurePermission(handle))) throw new Error(t.syncPermissionDenied)
         await saveDirectoryHandle(syncer.id, handle)
       }
-      const manifest = await request<DatasetManifest>(`/api/v1/datasets/${syncer.dataset_id}/manifest`, auth)
+      // Incremental by batch: the manifest only carries what this mirror has not
+      // seen yet, so a repeated sync downloads nothing.
+      const query = new URLSearchParams({ since: String(syncer.last_batch) })
+      if (syncer.table_name) query.set("table", syncer.table_name)
+      const manifest = await request<Manifest>(`/api/v1/datasets/${syncer.dataset_id}/manifest?${query.toString()}`, auth)
       const summary = await runSync({
         directory: handle,
         datasetId: syncer.dataset_id,
-        prefix: syncer.subdir,
-        files: manifest.files,
+        latestBatch: manifest.latest_batch,
+        files: manifest.files.map((file) => ({ path: file.path, size: file.bytes, sha256: file.sha256 })),
         download: (path) => requestBytes(`/api/v1/datasets/${syncer.dataset_id}/files/${encodeURI(path)}`, auth),
         onProgress: (value) => setProgress((previous) => ({ ...previous, [syncer.id]: value })),
       })
-      await request(`/api/v1/syncers/${syncer.id}/completed`, auth, { method: "POST" })
+      await request(`/api/v1/syncers/${syncer.id}/completed`, auth, { method: "POST", body: JSON.stringify({ batch: summary.latestBatch }) })
       toast.success(`${t.syncCompleted}: ↓${summary.downloaded} · ✕${summary.removed} · =${summary.skipped}`)
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     } catch (error) {
@@ -94,9 +110,10 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
   return <div className="flex flex-col gap-6">
     <div>
       <h1 className="m-0 text-2xl font-semibold tracking-tight">{t.syncTitle}</h1>
-      <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{t.syncDescription}</p>
+      <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t.syncDescription}</p>
     </div>
     {!supported && <p className="text-sm text-muted-foreground">{t.syncUnsupported}</p>}
+
     <Card>
       <CardHeader><CardTitle>{t.newSyncer}</CardTitle></CardHeader>
       <CardContent>
@@ -109,43 +126,68 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
               </Field>
               <Field>
                 <FieldLabel>{t.syncerDataset}</FieldLabel>
-                <Select value={datasetId} onValueChange={(value) => setDatasetId(value ?? "")}>
+                <Select value={datasetId} onValueChange={(value) => { setDatasetId(value ?? ""); setTableName(ALL_TABLES) }}>
                   <SelectTrigger><SelectValue placeholder={t.chooseDataset} /></SelectTrigger>
                   <SelectContent>{(datasets.data ?? []).map((dataset) => <SelectItem key={dataset.id} value={dataset.id}>{dataset.name}</SelectItem>)}</SelectContent>
                 </Select>
               </Field>
               <Field>
-                <FieldLabel htmlFor="syncer-subdir">{t.syncerSubdir}</FieldLabel>
-                <Input id="syncer-subdir" value={subdir} onChange={(event) => setSubdir(event.target.value)} placeholder="btc/" />
+                <FieldLabel>{t.syncerTable}</FieldLabel>
+                <Select value={tableName} onValueChange={(value) => setTableName(value ?? ALL_TABLES)} disabled={!selected}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ALL_TABLES}>{t.allTables}</SelectItem>
+                    {(selected?.tables ?? []).map((table) => <SelectItem key={table.name} value={table.name}>{table.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
               </Field>
             </div>
           </FieldGroup>
-          <div><Button type="submit" disabled={create.isPending || datasetId === ""}><PlusIcon data-icon="inline-start" />{create.isPending ? t.creating : t.create}</Button></div>
+          <FieldDescription>{t.syncIncrementalHint}</FieldDescription>
+          <div><Button type="submit" disabled={create.isPending || !datasetId}><PlusIcon data-icon="inline-start" />{create.isPending ? t.creating : t.create}</Button></div>
         </form>
       </CardContent>
     </Card>
+
     <Card>
       <CardHeader><CardTitle>{t.syncTitle}</CardTitle></CardHeader>
       <CardContent>
-        {list.length === 0 ? <Empty><EmptyHeader><EmptyMedia variant="icon"><RefreshCcwIcon /></EmptyMedia><EmptyTitle>{t.noSyncers}</EmptyTitle><EmptyDescription>{t.syncDescription}</EmptyDescription></EmptyHeader></Empty> : <Table>
-          <TableHeader><TableRow><TableHead>{t.syncerName}</TableHead><TableHead>{t.syncerDataset}</TableHead><TableHead>{t.lastSynced}</TableHead><TableHead className="text-right" /></TableRow></TableHeader>
-          <TableBody>{list.map((syncer) => <TableRow key={syncer.id}>
-            <TableCell className="min-w-48 align-top">
-              <span className="font-medium">{syncer.name}</span>
-              {syncer.subdir !== "" && <span className="ml-2 font-mono text-xs text-muted-foreground">/{syncer.subdir}</span>}
-              <SyncStatus state={progress[syncer.id]} t={t} />
-            </TableCell>
-            <TableCell className="align-top">{syncer.dataset_id}</TableCell>
-            <TableCell className="align-top text-muted-foreground">{syncer.last_synced_at ? formatTimeAgo(syncer.last_synced_at, locale) : t.neverSynced}</TableCell>
-            <TableCell className="text-right align-top"><div className="flex justify-end gap-2">
-              <Button size="sm" variant="outline" disabled={!supported || busy === syncer.id} onClick={() => void run(syncer, true)}><FolderOpenIcon data-icon="inline-start" />{t.syncPick}</Button>
-              <Button size="sm" variant="ghost" disabled={!supported || busy === syncer.id} onClick={() => void run(syncer, false)}><RefreshCcwIcon data-icon="inline-start" />{t.syncResume}</Button>
-              <Button size="sm" variant="ghost" disabled={busy === syncer.id} onClick={() => setRemoving(syncer)} aria-label={t.remove}><Trash2Icon /></Button>
-            </div></TableCell>
-          </TableRow>)}</TableBody>
+        {list.length === 0 ? <p className="text-sm text-muted-foreground">{t.noSyncers}</p> : <Table>
+          <TableHeader><TableRow>
+            <TableHead>{t.syncerName}</TableHead>
+            <TableHead>{t.syncerDataset}</TableHead>
+            <TableHead>{t.syncerTable}</TableHead>
+            <TableHead>{t.mirroredBatch}</TableHead>
+            <TableHead>{t.lastSynced}</TableHead>
+            <TableHead className="text-right" />
+          </TableRow></TableHeader>
+          <TableBody>{list.map((syncer) => {
+            const state = progress[syncer.id]
+            return <TableRow key={syncer.id}>
+              <TableCell className="font-medium">{syncer.name}</TableCell>
+              <TableCell className="font-mono text-xs">{syncer.dataset_id}</TableCell>
+              <TableCell className="font-mono text-xs">{syncer.table_name ?? t.allTables}</TableCell>
+              <TableCell className="font-mono text-xs">{syncer.last_batch}</TableCell>
+              <TableCell className="text-muted-foreground">
+                {syncer.last_synced_at ? formatTime(syncer.last_synced_at, locale) : t.neverSynced}
+                {state && state.phase !== "completed" && state.phase !== "failed" && <span className="ml-2 text-xs">{phaseLabel(state, t)}</span>}
+                {state?.phase === "failed" && <span className="ml-2 text-xs text-destructive">{state.error}</span>}
+              </TableCell>
+              <TableCell className="text-right">
+                <div className="flex justify-end gap-1">
+                  <Button size="sm" variant="outline" disabled={!supported || busy === syncer.id} onClick={() => void run(syncer, false)}>
+                    <RefreshCcwIcon data-icon="inline-start" />
+                    {syncer.last_synced_at ? t.syncResume : t.syncPick}
+                  </Button>
+                  <Button size="icon-sm" variant="ghost" aria-label={t.remove} onClick={() => setRemoving(syncer)}><Trash2Icon /></Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          })}</TableBody>
         </Table>}
       </CardContent>
     </Card>
+
     <AlertDialog open={removing !== null} onOpenChange={(open) => { if (!open) setRemoving(null) }}>
       <AlertDialogContent>
         <AlertDialogHeader>
@@ -154,19 +196,17 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>{t.cancel}</AlertDialogCancel>
-          <AlertDialogAction onClick={() => removing && remove.mutate(removing)}>{t.remove}</AlertDialogAction>
+          <AlertDialogAction onClick={() => { if (removing) remove.mutate(removing) }}>{t.remove}</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
   </div>
 }
 
-function SyncStatus({ state, t }: { state?: SyncProgress; t: Copy }) {
-  if (!state) return null
-  const label = state.phase === "scanning" ? t.progressScanning : state.phase === "downloading" ? t.progressDownloading : state.phase === "cleaning" ? t.progressCleaning : state.phase === "completed" ? t.progressCompleted : t.progressFailed
-  const ratio = state.phase === "failed" ? 0 : state.total === 0 ? (state.phase === "completed" ? 100 : 0) : Math.min(100, (state.completed / state.total) * 100)
-  return <div className="mt-2 flex max-w-72 flex-col gap-1">
-    <span className="truncate text-xs text-muted-foreground">{state.error ?? `${label}${state.current ? ` · ${state.current}` : ""}`}</span>
-    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary" style={{ width: `${ratio}%` }} /></div>
-  </div>
+function phaseLabel(state: SyncProgress, t: Copy) {
+  if (state.phase === "scanning") return t.progressScanning
+  if (state.phase === "downloading") return `${t.progressDownloading} ${state.completed}/${state.total}`
+  if (state.phase === "cleaning") return t.progressCleaning
+  if (state.phase === "failed") return t.progressFailed
+  return t.progressCompleted
 }

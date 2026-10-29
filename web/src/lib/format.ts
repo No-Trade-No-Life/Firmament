@@ -33,3 +33,19 @@ export function formatBytes(bytes: number) {
 export function showError(error: Error) {
   toast.error(error.message)
 }
+
+// Data timestamps arrive as RFC 3339 strings (they are data, not bookkeeping),
+// while bookkeeping timestamps arrive as epoch seconds.
+export function formatStamp(instant?: string | null, locale?: string) {
+  if (!instant) return "—"
+  const date = new Date(instant)
+  if (Number.isNaN(date.getTime())) return instant
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }).format(date)
+}
+
+export function formatWindow(seconds: number) {
+  if (!seconds) return "0"
+  if (seconds % 86_400 === 0) return `${seconds / 86_400}d`
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`
+  return `${Math.round(seconds / 60)}m`
+}

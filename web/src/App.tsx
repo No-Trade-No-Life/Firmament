@@ -15,10 +15,11 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { request, type AuthSdk } from "./lib/api"
 import { copy, initialLocale, negotiateLocale, persistLocale, type Copy, type Locale } from "./lib/i18n"
 import type { LinkitStatus, Me } from "./lib/types"
+import { DatasetPage } from "./pages/dataset-page"
 import { DatasetsPage } from "./pages/datasets-page"
+import { IngestPage } from "./pages/ingest-page"
 import { LinkitPage } from "./pages/linkit-page"
 import { OverviewPage } from "./pages/overview-page"
-import { PublishPage } from "./pages/publish-page"
 import { SetupPage } from "./pages/setup-page"
 import { SyncPage } from "./pages/sync-page"
 import { SystemResourcesPage } from "./pages/system-resources-page"
@@ -83,7 +84,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
         { to: "/datasets", label: t.datasets, icon: <DatabaseIcon /> },
         { to: "/sync", label: t.sync, icon: <HardDriveDownloadIcon /> },
         { to: "/linkit", label: t.linkit, icon: <BotIcon /> },
-        ...(me.data.is_root ? [{ to: "/publish", label: t.publish, icon: <KeyRoundIcon /> }] : []),
+        ...(me.data.is_root ? [{ to: "/ingest", label: t.ingest, icon: <KeyRoundIcon /> }] : []),
       ],
     },
     ...(me.data.is_root ? [{ label: t.navSystem, items: [{ to: "/system", label: t.systemResources, icon: <HardDriveIcon /> }] }] : []),
@@ -100,11 +101,12 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
         headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button></div>}
       >
         <Routes>
-          <Route path="/" element={<OverviewPage auth={auth} locale={locale} t={t} />} />
-          <Route path="/datasets" element={<DatasetsPage auth={auth} locale={locale} t={t} isRoot={me.data.is_root} />} />
+          <Route path="/" element={<OverviewPage auth={auth} t={t} />} />
+          <Route path="/datasets" element={<DatasetsPage auth={auth} t={t} isRoot={me.data.is_root} />} />
+          <Route path="/datasets/:id" element={<DatasetPage auth={auth} locale={locale} t={t} isRoot={me.data.is_root} />} />
           <Route path="/sync" element={<SyncPage auth={auth} locale={locale} t={t} />} />
           <Route path="/linkit" element={<LinkitPage auth={auth} locale={locale} t={t} />} />
-          <Route path="/publish" element={me.data.is_root ? <PublishPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
+          <Route path="/ingest" element={me.data.is_root ? <IngestPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
           <Route path="/system" element={me.data.is_root ? <SystemResourcesPage auth={auth} locale={locale} t={t} /> : <Navigate to="/" replace />} />
           <Route path="/setup" element={<SetupPage auth={auth} t={t} onDone={refresh} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
@@ -118,7 +120,7 @@ function pageTitle(pathname: string, t: Copy) {
   if (pathname.startsWith("/datasets")) return t.datasets
   if (pathname.startsWith("/sync")) return t.sync
   if (pathname === "/linkit") return t.linkit
-  if (pathname === "/publish") return t.publish
+  if (pathname === "/ingest") return t.ingest
   if (pathname === "/system") return t.systemResources
   return t.overview
 }
