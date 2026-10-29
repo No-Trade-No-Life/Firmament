@@ -13,27 +13,24 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { request, type AuthSdk } from "../lib/api"
-import { formatBytes, formatWindow, showError } from "../lib/format"
-import { granularityLabel, type Copy } from "../lib/i18n"
-import type { DatasetView, FlushResult, TableSpec } from "../lib/types"
+import { formatBytes, showError } from "../lib/format"
+import { cadenceLabel, granularityLabel, type Copy } from "../lib/i18n"
+import type { CoolingCadence, DatasetView, FlushResult, TableSpec } from "../lib/types"
 
-const TABLE_TEMPLATE = `[
-  {
-    "name": "bars",
-    "primary_key": ["symbol", "updated_at"],
-    "time_column": "updated_at",
-    "granularity": "day",
-    "columns": [
-      { "name": "symbol", "type": "text" },
-      { "name": "updated_at", "type": "timestamp" },
-      { "name": "open", "type": "real" },
-      { "name": "high", "type": "real" },
-      { "name": "low", "type": "real" },
-      { "name": "close", "type": "real" },
-      { "name": "volume", "type": "real" }
-    ]
-  }
-]`
+const TABLE_TEMPLATE = `{
+  "primary_key": ["symbol", "updated_at"],
+  "time_column": "updated_at",
+  "granularity": "day",
+  "columns": [
+    { "name": "symbol", "type": "text" },
+    { "name": "updated_at", "type": "timestamp" },
+    { "name": "open", "type": "real" },
+    { "name": "high", "type": "real" },
+    { "name": "low", "type": "real" },
+    { "name": "close", "type": "real" },
+    { "name": "volume", "type": "real" }
+  ]
+}`
 
 export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRoot: boolean }) {
   const queryClient = useQueryClient()
@@ -42,18 +39,17 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
   const [id, setId] = useState("")
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
-  const [windowValue, setWindowValue] = useState("7")
-  const [windowUnit, setWindowUnit] = useState<"days" | "hours">("days")
-  const [tables, setTables] = useState(TABLE_TEMPLATE)
+  const [cadence, setCadence] = useState<CoolingCadence>("daily")
+  const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
+  const [tableSpec, setTableSpec] = useState(TABLE_TEMPLATE)
   const list = datasets.data ?? []
 
   const create = useMutation({
     mutationFn: () => {
-      const parsed = JSON.parse(tables) as TableSpec[]
-      const hotWindowSeconds = Number(windowValue) * (windowUnit === "days" ? 86_400 : 3_600)
+      const table = JSON.parse(tableSpec) as TableSpec
       return request<DatasetView>("/api/v1/datasets", auth, {
         method: "POST",
-        body: JSON.stringify({ id, name, description, hot_window_seconds: hotWindowSeconds, tables: parsed }),
+        body: JSON.stringify({ id, name, description, cooling: { cadence, timezone }, table }),
       })
     },
     onSuccess: () => {
@@ -61,7 +57,7 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
       setId("")
       setName("")
       setDescription("")
-      setTables(TABLE_TEMPLATE)
+      setTableSpec(TABLE_TEMPLATE)
       toast.success(t.datasetCreated)
       void queryClient.invalidateQueries({ queryKey: ["datasets"] })
     },
@@ -86,18 +82,16 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
           </div>
           <CardDescription>{dataset.description || "—"}</CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-col gap-3">
+        <CardContent className="flex flex-1 flex-col gap-3">
           <div className="flex flex-wrap gap-1">
-            {dataset.tables.map((table) => <Badge key={table.name} variant="secondary" className="font-mono text-xs">
-              {table.name} · {granularityLabel(table.granularity, t)}
-            </Badge>)}
+            <Badge variant="secondary" className="text-xs">{t.granularity} · {granularityLabel(dataset.table.granularity, t)}</Badge>
           </div>
-          <p className="text-xs text-muted-foreground">
-            {t.hotWindow} {formatWindow(dataset.hot_window_seconds)} · {t.hotRows} {dataset.hot_rows.toLocaleString()}
-            {dataset.coolable_rows > 0 ? ` · ${t.coolableRows} ${dataset.coolable_rows.toLocaleString()}` : ""}
-            {" · "}{t.coldFiles} {dataset.cold_files} · {formatBytes(dataset.cold_bytes)}
-          </p>
-          <div className="flex flex-wrap gap-2">
+          <div className="text-xs text-muted-foreground">
+            <p>{t.coolingTitle} {cadenceLabel(dataset.cooling.cadence, t)} · {dataset.cooling.timezone}</p>
+            <p>{t.hotRows} {dataset.table.rows.toLocaleString()}{dataset.table.coolable_rows > 0 ? ` · ${t.coolableRows} ${dataset.table.coolable_rows.toLocaleString()}` : ""}</p>
+            <p>{t.coldFiles} {dataset.table.cold_files} · {t.coldBytes} {formatBytes(dataset.table.cold_bytes)}</p>
+          </div>
+          <div className="mt-auto flex flex-wrap gap-2">
             <Link to={`/datasets/${dataset.id}`} className={buttonVariants({ variant: "outline", size: "sm" })}>{t.openDataset}</Link>
             {isRoot && <FlushButton auth={auth} dataset={dataset} t={t} />}
           </div>
@@ -129,23 +123,26 @@ export function DatasetsPage({ auth, t, isRoot }: { auth: AuthSdk; t: Copy; isRo
               <Input id="dataset-description" value={description} onChange={(event) => setDescription(event.target.value)} />
             </Field>
             <Field>
-              <FieldLabel>{t.hotWindow}</FieldLabel>
-              <div className="flex gap-2">
-                <Input className="max-w-24" type="number" min="0" value={windowValue} onChange={(event) => setWindowValue(event.target.value)} />
-                <Select value={windowUnit} onValueChange={(value) => setWindowUnit(value as "days" | "hours")}>
-                  <SelectTrigger className="max-w-32"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="days">{t.windowDays}</SelectItem>
-                    <SelectItem value="hours">{t.windowHours}</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <FieldDescription>{t.hotWindowHint}</FieldDescription>
+              <FieldLabel>{t.cadence}</FieldLabel>
+              <Select value={cadence} onValueChange={(value) => setCadence(value as CoolingCadence)}>
+                <SelectTrigger className="max-w-48"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="daily">{t.cadenceDaily}</SelectItem>
+                  <SelectItem value="weekly">{t.cadenceWeekly}</SelectItem>
+                  <SelectItem value="monthly">{t.cadenceMonthly}</SelectItem>
+                </SelectContent>
+              </Select>
+              <FieldDescription>{t.coolingHint}</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="dataset-tables">{t.tablesJson}</FieldLabel>
-              <Textarea id="dataset-tables" className="min-h-64 font-mono text-xs" value={tables} onChange={(event) => setTables(event.target.value)} spellCheck={false} />
-              <FieldDescription>{t.tablesJsonHint}</FieldDescription>
+              <FieldLabel htmlFor="dataset-timezone">{t.timezone}</FieldLabel>
+              <Input id="dataset-timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} className="max-w-64" required />
+              <FieldDescription>{t.timezoneHint}</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="dataset-table">{t.tableJson}</FieldLabel>
+              <Textarea id="dataset-table" className="min-h-64 font-mono text-xs" value={tableSpec} onChange={(event) => setTableSpec(event.target.value)} spellCheck={false} />
+              <FieldDescription>{t.tableJsonHint}</FieldDescription>
             </Field>
           </FieldGroup>
           <div className="flex justify-end gap-2">

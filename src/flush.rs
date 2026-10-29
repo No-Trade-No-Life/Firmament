@@ -1,9 +1,9 @@
-//! Cooling: the one operation that turns the hot window into cold history.
+//! Cooling: the one operation that turns the hot store into cold history.
 //!
-//! A pass claims every row that has aged past the dataset's hot window, writes
-//! it as immutable Parquet into the matching time partition, verifies the
-//! object, records the batch (the commit point), and only then deletes the rows
-//! from the hot database. A crash before the commit leaves the hot rows alone;
+//! A pass claims every row that has aged past the current period, writes it as
+//! immutable Parquet into the matching time partition, verifies the object,
+//! records the batch (the commit point), and only then deletes the rows from
+//! the hot database. A crash before the commit leaves the hot rows alone;
 //! a crash after it leaves rows that are already safe in cold storage, and the
 //! next pass drops them.
 
@@ -13,10 +13,11 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::cold::{self, ColdObjectMetadata, ColdStore, object_key, rows_to_parquet};
+use crate::cooling::{self, CoolingSpec};
 use crate::db::{ColdFile, Database, Dataset};
 use crate::files::sha256_hex;
 use crate::hot::{self, HotRow, HotStore};
-use crate::schema::{Granularity, TableSpec, Value};
+use crate::schema::Value;
 
 /// Rows per Parquet file; a bucket larger than this is split into several
 /// files rather than buffered as one giant object.
@@ -35,19 +36,17 @@ pub struct FlushReport {
     pub bytes: u64,
 }
 
-/// The instant before which rows are cold, aligned down to the partition edge.
+/// The start of the current period, formatted for `SQLite` range comparisons.
 ///
-/// Aligning to the partition keeps a pass emitting whole buckets, so a table
-/// normally gains one file per partition instead of one file per minute.
-pub fn cooling_boundary(
-    now: DateTime<Utc>,
-    hot_window_seconds: i64,
-    granularity: Granularity,
-) -> String {
-    let cutoff = now - chrono::Duration::seconds(hot_window_seconds.max(0));
-    granularity
-        .truncate(cutoff)
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+/// Everything older than this belongs to a period that already rolled over, so
+/// it is exactly the set of rows that may cool. The current period stays hot.
+///
+/// # Errors
+///
+/// Returns an error when the dataset carries an unknown timezone.
+pub fn cooling_boundary(now: DateTime<Utc>, cooling: &CoolingSpec) -> Result<String, String> {
+    cooling::boundary(now, cooling)
+        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 /// Runs one cooling pass over a dataset.
@@ -85,9 +84,7 @@ pub async fn run_flush(
             Ok(report)
         }
         Err(message) => {
-            for table in &dataset.tables {
-                let _ = hot.release(dataset_id, table, pass.batch);
-            }
+            let _ = hot.release(dataset_id, pass.batch);
             let _ = database.finish_flush(&pass.id, "failed", 0, 0, 0, &message);
             Err(message)
         }
@@ -101,32 +98,28 @@ async fn cool(
     dataset: &Dataset,
     batch: i64,
 ) -> Result<FlushReport, String> {
-    hot.purge_stale_claims(&dataset.id, &dataset.tables, batch)
+    hot.purge_stale_claims(&dataset.id, batch)
         .map_err(|error| error.to_string())?;
     let now = Utc::now();
+    let boundary = cooling_boundary(now, &dataset.cooling)?;
     let mut report = FlushReport {
         batch,
         ..FlushReport::default()
     };
     let mut written: Vec<ColdFile> = Vec::new();
     let mut sequence = 0_usize;
-    for table in &dataset.tables {
-        let boundary = cooling_boundary(now, dataset.hot_window_seconds, table.granularity);
-        let claimed = hot
-            .claim(&dataset.id, table, &boundary, batch)
-            .map_err(|error| error.to_string())?;
-        if claimed == 0 {
-            continue;
-        }
+    let claimed = hot
+        .claim(&dataset.id, &dataset.table, &boundary, batch)
+        .map_err(|error| error.to_string())?;
+    if claimed > 0 {
         let rows = hot
-            .claimed(&dataset.id, table, batch)
+            .claimed(&dataset.id, &dataset.table, &dataset.cooling, batch)
             .map_err(|error| error.to_string())?;
         for (bucket, group) in group_by_bucket(&rows) {
             for chunk in group.chunks(FILE_ROWS) {
-                let file = write_partition_file(
-                    cold_store, dataset, table, batch, sequence, &bucket, chunk,
-                )
-                .await?;
+                let file =
+                    write_partition_file(cold_store, dataset, batch, sequence, &bucket, chunk)
+                        .await?;
                 sequence += 1;
                 report.files += 1;
                 report.rows += file.rows;
@@ -157,30 +150,27 @@ async fn cool(
     database
         .record_batch(&dataset.id, batch, &written)
         .map_err(|error| error.to_string())?;
-    for table in &dataset.tables {
-        hot.purge(&dataset.id, table, batch)
-            .map_err(|error| error.to_string())?;
-    }
+    hot.purge(&dataset.id, batch)
+        .map_err(|error| error.to_string())?;
     Ok(report)
 }
 
 async fn write_partition_file(
     cold_store: &dyn ColdStore,
     dataset: &Dataset,
-    table: &TableSpec,
     batch: i64,
     sequence: usize,
     bucket: &str,
     rows: &[&HotRow],
 ) -> Result<ColdFile, String> {
+    let table = &dataset.table;
     let values = rows
         .iter()
         .map(|row| row.values.clone())
         .collect::<Vec<Vec<Value>>>();
     let body = rows_to_parquet(table, &values).map_err(|error| error.to_string())?;
     let path = format!(
-        "{}/{key}={bucket}/{batch:06}-{sequence:04}.parquet",
-        table.name,
+        "{key}={bucket}/{batch:06}-{sequence:04}.parquet",
         key = table.granularity.key()
     );
     let partition = format!("{}={bucket}", table.granularity.key());
@@ -217,7 +207,6 @@ async fn write_partition_file(
     Ok(ColdFile {
         dataset_id: dataset.id.clone(),
         batch,
-        table_name: table.name.clone(),
         path,
         partition,
         rows: rows.len() as i64,
@@ -249,6 +238,7 @@ mod tests {
 
     use super::{cooling_boundary, run_flush};
     use crate::cold::{ColdError, ColdObjectBody, ColdObjectHead, ColdObjectMetadata, ColdStore};
+    use crate::cooling::{Cadence, CoolingSpec};
     use crate::db::Database;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
@@ -322,7 +312,6 @@ mod tests {
 
     fn table() -> TableSpec {
         TableSpec {
-            name: "bars".to_owned(),
             primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
             time_column: "updated_at".to_owned(),
             granularity: Granularity::Day,
@@ -350,7 +339,16 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database");
         database
-            .create_dataset("bars", "Bars", "", 0, &[table()])
+            .create_dataset(
+                "bars",
+                "Bars",
+                "",
+                &CoolingSpec {
+                    cadence: Cadence::Daily,
+                    timezone: "UTC".to_owned(),
+                },
+                &table(),
+            )
             .expect("dataset");
         (state, database)
     }
@@ -367,26 +365,30 @@ mod tests {
     }
 
     #[test]
-    fn the_boundary_follows_the_window_and_the_partition_edge() {
+    fn the_boundary_is_the_start_of_the_current_period() {
         let now = DateTime::parse_from_rfc3339("2026-10-05T13:45:00Z")
             .expect("parses")
             .with_timezone(&chrono::Utc);
+        let daily = CoolingSpec {
+            cadence: Cadence::Daily,
+            timezone: "UTC".to_owned(),
+        };
         assert_eq!(
-            cooling_boundary(now, 86_400, Granularity::Day),
-            "2026-10-04T00:00:00.000000Z"
+            cooling_boundary(now, &daily).expect("boundary"),
+            "2026-10-05T00:00:00.000000Z"
         );
+        let monthly = CoolingSpec {
+            cadence: Cadence::Monthly,
+            timezone: "Asia/Shanghai".to_owned(),
+        };
         assert_eq!(
-            cooling_boundary(now, 3 * 3600, Granularity::Hour),
-            "2026-10-05T10:00:00.000000Z"
-        );
-        assert_eq!(
-            cooling_boundary(now, 0, Granularity::Month),
-            "2026-10-01T00:00:00.000000Z"
+            cooling_boundary(now, &monthly).expect("boundary"),
+            "2026-09-30T16:00:00.000000Z"
         );
     }
 
     #[tokio::test]
-    async fn a_pass_writes_one_file_per_partition_and_empties_the_window() {
+    async fn a_pass_writes_one_file_per_partition_and_clears_cooled_rows() {
         let (_state, database) = seeded();
         let table = table();
         let hot = database.hot();
@@ -413,8 +415,8 @@ mod tests {
             cold.keys(),
             vec![
                 "datasets/bars/_catalog/000001.json".to_owned(),
-                "datasets/bars/bars/day=2026-09-01/000001-0000.parquet".to_owned(),
-                "datasets/bars/bars/day=2026-09-02/000001-0001.parquet".to_owned(),
+                "datasets/bars/day=2026-09-01/000001-0000.parquet".to_owned(),
+                "datasets/bars/day=2026-09-02/000001-0001.parquet".to_owned(),
             ]
         );
         assert_eq!(
@@ -422,7 +424,7 @@ mod tests {
             1,
             "only the row still inside the window stays hot"
         );
-        let catalog = database.cold_files("bars", 0, None).expect("catalogue");
+        let catalog = database.cold_files("bars", 0).expect("catalogue");
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].min_time, "2026-09-01T00:00:00.000000Z");
         assert_eq!(catalog[0].max_time, "2026-09-01T00:01:00.000000Z");
@@ -445,7 +447,7 @@ mod tests {
             .await
             .expect("flush");
 
-        let bytes = cold.object("datasets/bars/bars/day=2026-09-01/000001-0000.parquet");
+        let bytes = cold.object("datasets/bars/day=2026-09-01/000001-0000.parquet");
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
             bytes::Bytes::from(bytes),
         )
@@ -513,7 +515,7 @@ mod tests {
         );
         assert!(
             database
-                .cold_files("bars", 0, None)
+                .cold_files("bars", 0)
                 .expect("catalogue")
                 .is_empty()
         );
@@ -557,10 +559,7 @@ mod tests {
             "the new version is a new row in cold storage"
         );
         assert_eq!(
-            database
-                .cold_files("bars", 0, None)
-                .expect("catalogue")
-                .len(),
+            database.cold_files("bars", 0).expect("catalogue").len(),
             2,
             "cold storage appends versions instead of rewriting history"
         );

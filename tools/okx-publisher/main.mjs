@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // OKX reference publisher for Firmament.
 //
-// Firmament never collects anything by itself: it owns a writable hot window and
+// Firmament never collects anything by itself: it owns a writable hot store and
 // cools it into Parquet. This script is the collecting half — it pulls
-// BTC-USDT-SWAP perpetual-swap data from OKX's public API and writes rows into
-// two declared tables:
+// BTC-USDT-SWAP perpetual-swap data from OKX's public API. A dataset is one
+// table, so the two shapes live in two datasets:
 //
-//   klines   (symbol, updated_at, open, high, low, close, volume)
-//   funding  (symbol, updated_at, funding_rate)
+//   <dataset>          klines  (symbol, updated_at, open, high, low, close, volume)
+//   <funding-dataset>  funding (symbol, updated_at, funding_rate)
 //
 // `updated_at` is the instant the information was produced, which is what the
 // cold layout is partitioned by. Re-sending the same primary key replaces the
@@ -20,7 +20,8 @@
 //   --since <YYYY-MM-DD>     window start, inclusive (required)
 //   --until <YYYY-MM-DD>     window end, exclusive; defaults to now
 //   --base-url <url>         Firmament base URL (default http://127.0.0.1:8080)
-//   --dataset <id>           dataset id (default okx-btc-swap)
+//   --dataset <id>           klines dataset id (default okx-btc-swap)
+//   --funding-dataset <id>   funding dataset id (default <dataset>-funding)
 //   --inst <instId>          OKX instrument (default BTC-USDT-SWAP)
 //   --okx-base <url>         OKX API base (default https://www.okx.com)
 //   --pace-ms <ms>           delay between OKX requests (default 150)
@@ -199,8 +200,8 @@ function fundingRow(inst, record) {
   };
 }
 
-async function ingest(context, table, rows) {
-  const url = `${context.baseUrl}/api/v1/ingest/${context.dataset}/${table}`;
+async function ingest(context, dataset, label, rows) {
+  const url = `${context.baseUrl}/api/v1/ingest/${dataset}`;
   let written = 0;
   for (let index = 0; index < rows.length; index += context.batch) {
     const chunk = rows.slice(index, index + context.batch);
@@ -214,10 +215,10 @@ async function ingest(context, table, rows) {
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
-      throw new Error(`ingest ${table} failed: HTTP ${response.status} ${detail}`);
+      throw new Error(`ingest ${label} failed: HTTP ${response.status} ${detail}`);
     }
     written += chunk.length;
-    console.log(`  ${table}: ${written}/${rows.length} rows`);
+    console.log(`  ${label}: ${written}/${rows.length} rows`);
   }
   return written;
 }
@@ -232,6 +233,7 @@ async function main() {
   const context = {
     baseUrl: (options["base-url"] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     dataset: options.dataset ?? "okx-btc-swap",
+    fundingDataset: options["funding-dataset"] ?? `${options.dataset ?? "okx-btc-swap"}-funding`,
     writeToken: required(options, "write-token"),
     okxBase: options["okx-base"] ?? "https://www.okx.com",
     pace: Number(options["pace-ms"] ?? 150),
@@ -257,10 +259,10 @@ async function main() {
     console.log(`dry-run complete: ${klines.length} klines and ${fundingRows.length} funding rows`);
     return;
   }
-  const writtenKlines = await ingest(context, "klines", klines);
-  const writtenFunding = await ingest(context, "funding", fundingRows);
+  const writtenKlines = await ingest(context, context.dataset, "klines", klines);
+  const writtenFunding = await ingest(context, context.fundingDataset, "funding", fundingRows);
   console.log(
-    `done: ${writtenKlines} klines and ${writtenFunding} funding rows into ${context.baseUrl}/api/v1/ingest/${context.dataset}`,
+    `done: ${writtenKlines} klines into ${context.dataset} and ${writtenFunding} funding rows into ${context.fundingDataset}`,
   );
 }
 

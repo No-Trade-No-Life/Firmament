@@ -1,7 +1,6 @@
 //! The HTTP surface: datasets and their schemas, the ingest path publishers
 //! use, the cold manifest mirrors follow, and the small admin corners.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use auth_mini_axum::{AuthMiniLayer, AuthMiniPrincipal};
@@ -22,6 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::cold::{ColdStore, object_key};
+use crate::cooling::{self, CoolingSpec};
 use crate::crypto::write_token_secret;
 use crate::db::{
     DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, Flush, IngestEvent,
@@ -29,7 +29,7 @@ use crate::db::{
 };
 use crate::files::sha256_hex;
 use crate::flush::{FlushReport, cooling_boundary, run_flush};
-use crate::hot::{HotError, TableStat, row_json};
+use crate::hot::{HotError, row_json};
 use crate::linkit::{self, LinkitError};
 use crate::resources::{ResourceMonitor, SystemResourcesSnapshot};
 use crate::schema::{self, ColumnSpec, Granularity, TableSpec};
@@ -90,7 +90,7 @@ pub fn router(
     // Publishers authenticate with write tokens instead of an Auth Mini
     // session, so the ingest route lives outside the session layer.
     let ingest = Router::new()
-        .route("/{dataset_id}/{table}", post(ingest_rows))
+        .route("/{dataset_id}", post(ingest_rows))
         .route_layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT));
     Router::new()
         .route("/api/health", get(health))
@@ -193,7 +193,6 @@ impl Actor {
 
 #[derive(Debug, Serialize)]
 struct TableView {
-    name: String,
     primary_key: Vec<String>,
     time_column: String,
     granularity: Granularity,
@@ -213,108 +212,42 @@ struct DatasetView {
     id: String,
     name: String,
     description: String,
-    hot_window_seconds: i64,
+    cooling: CoolingSpec,
     last_batch: i64,
     created_at: i64,
-    tables: Vec<TableView>,
-    hot_rows: i64,
-    coolable_rows: i64,
-    cold_files: i64,
-    cold_bytes: u64,
-    cold_from: Option<String>,
-    cold_until: Option<String>,
+    table: TableView,
 }
 
 fn dataset_view(database: &Database, id: &str) -> Result<DatasetView, ApiError> {
     let dataset = database.dataset(id)?.ok_or_else(ApiError::not_found)?;
-    let now = Utc::now();
-    let boundaries = dataset
-        .tables
-        .iter()
-        .map(|table| {
-            (
-                table.name.clone(),
-                cooling_boundary(now, dataset.hot_window_seconds, table.granularity),
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    // INVARIANT: the cooling calendar was validated when the dataset was created.
+    let boundary = cooling_boundary(Utc::now(), &dataset.cooling).map_err(ApiError::internal)?;
     let stats = database
         .hot()
-        .stats(&dataset.id, &dataset.tables, &boundaries)?;
+        .stats(&dataset.id, &dataset.table, &boundary)?;
     let cold = database.cold_summary(&dataset.id)?;
-    let mut views = Vec::with_capacity(dataset.tables.len());
-    let mut hot_rows = 0;
-    let mut coolable_rows = 0;
-    let mut cold_files = 0;
-    let mut cold_bytes = 0_u64;
-    let mut cold_from: Option<String> = None;
-    let mut cold_until: Option<String> = None;
-    for table in &dataset.tables {
-        let stat = stats
-            .iter()
-            .find(|stat: &&TableStat| stat.table == table.name);
-        let summary = cold.iter().find(|entry| entry.table_name == table.name);
-        let rows = stat.map_or(0, |stat| stat.rows);
-        let coolable = stat.map_or(0, |stat| stat.coolable_rows);
-        let files = summary.map_or(0, |entry| entry.files);
-        let bytes = summary.map_or(0, |entry| entry.bytes);
-        hot_rows += rows;
-        coolable_rows += coolable;
-        cold_files += files;
-        cold_bytes += bytes;
-        cold_from = earliest(
-            cold_from,
-            summary.and_then(|entry| entry.earliest_time.clone()),
-        );
-        cold_until = latest(
-            cold_until,
-            summary.and_then(|entry| entry.latest_time.clone()),
-        );
-        views.push(TableView {
-            name: table.name.clone(),
-            primary_key: table.primary_key.clone(),
-            time_column: table.time_column.clone(),
-            granularity: table.granularity,
-            columns: table.columns.clone(),
-            rows,
-            coolable_rows: coolable,
-            oldest_time: stat.and_then(|stat| stat.oldest_time.clone()),
-            newest_time: stat.and_then(|stat| stat.newest_time.clone()),
-            cold_files: files,
-            cold_bytes: bytes,
-            cold_from: summary.and_then(|entry| entry.earliest_time.clone()),
-            cold_until: summary.and_then(|entry| entry.latest_time.clone()),
-        });
-    }
     Ok(DatasetView {
         id: dataset.id,
         name: dataset.name,
         description: dataset.description,
-        hot_window_seconds: dataset.hot_window_seconds,
+        cooling: dataset.cooling,
         last_batch: dataset.last_batch,
         created_at: dataset.created_at,
-        tables: views,
-        hot_rows,
-        coolable_rows,
-        cold_files,
-        cold_bytes,
-        cold_from,
-        cold_until,
+        table: TableView {
+            primary_key: dataset.table.primary_key,
+            time_column: dataset.table.time_column,
+            granularity: dataset.table.granularity,
+            columns: dataset.table.columns,
+            rows: stats.rows,
+            coolable_rows: stats.coolable_rows,
+            oldest_time: stats.oldest_time,
+            newest_time: stats.newest_time,
+            cold_files: cold.files,
+            cold_bytes: cold.bytes,
+            cold_from: cold.earliest_time,
+            cold_until: cold.latest_time,
+        },
     })
-}
-
-fn earliest(current: Option<String>, candidate: Option<String>) -> Option<String> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(current.min(candidate)),
-        (current, candidate) => current.or(candidate),
-    }
-}
-
-fn latest(current: Option<String>, candidate: Option<String>) -> Option<String> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(current.max(candidate)),
-        (current, candidate) => current.or(candidate),
-    }
 }
 
 async fn list_datasets(State(state): State<AppState>) -> Result<Json<Vec<DatasetView>>, ApiError> {
@@ -330,8 +263,8 @@ struct DatasetInput {
     id: String,
     name: String,
     description: Option<String>,
-    hot_window_seconds: i64,
-    tables: Vec<TableSpec>,
+    cooling: CoolingSpec,
+    table: TableSpec,
 }
 
 fn valid_dataset_id(id: &str) -> bool {
@@ -344,10 +277,6 @@ fn valid_dataset_id(id: &str) -> bool {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
         })
 }
-
-// Ten years: long enough for any research dataset, short enough to catch a
-// value that was meant as milliseconds.
-const MAX_HOT_WINDOW_SECONDS: i64 = 10 * 365 * 24 * 3600;
 
 async fn create_dataset(
     State(state): State<AppState>,
@@ -364,17 +293,11 @@ async fn create_dataset(
     if name.is_empty() {
         return Err(ApiError::bad_request("dataset name is required"));
     }
-    if !(0..=MAX_HOT_WINDOW_SECONDS).contains(&input.hot_window_seconds) {
-        return Err(ApiError::bad_request("invalid hot window"));
-    }
-    schema::validate(&input.tables).map_err(ApiError::bad_request)?;
-    state.database.create_dataset(
-        &id,
-        name,
-        &description,
-        input.hot_window_seconds,
-        &input.tables,
-    )?;
+    cooling::validate(&input.cooling).map_err(ApiError::bad_request)?;
+    schema::validate(&input.table).map_err(ApiError::bad_request)?;
+    state
+        .database
+        .create_dataset(&id, name, &description, &input.cooling, &input.table)?;
     Ok((
         StatusCode::CREATED,
         Json(dataset_view(&state.database, &id)?),
@@ -399,7 +322,6 @@ struct ManifestView {
 struct ManifestQuery {
     #[serde(default)]
     since: i64,
-    table: Option<String>,
 }
 
 async fn dataset_manifest(
@@ -411,15 +333,7 @@ async fn dataset_manifest(
         .database
         .dataset(&id)?
         .ok_or_else(ApiError::not_found)?;
-    if let Some(table) = query.table.as_deref()
-        && !dataset.tables.iter().any(|declared| declared.name == table)
-    {
-        return Err(ApiError::not_found());
-    }
-    let files =
-        state
-            .database
-            .cold_files(&dataset.id, query.since.max(0), query.table.as_deref())?;
+    let files = state.database.cold_files(&dataset.id, query.since.max(0))?;
     Ok(Json(ManifestView {
         dataset_id: dataset.id,
         latest_batch: dataset.last_batch,
@@ -429,7 +343,6 @@ async fn dataset_manifest(
 
 #[derive(Debug, Deserialize)]
 struct RowsQuery {
-    table: String,
     since: Option<String>,
     limit: Option<i64>,
 }
@@ -437,8 +350,7 @@ struct RowsQuery {
 #[derive(Debug, Serialize)]
 struct RowsView {
     dataset_id: String,
-    table: String,
-    hot_window_seconds: i64,
+    cooling: CoolingSpec,
     rows: Vec<Map<String, Value>>,
 }
 
@@ -451,21 +363,19 @@ async fn dataset_rows(
         .database
         .dataset(&id)?
         .ok_or_else(ApiError::not_found)?;
-    let table = dataset
-        .tables
-        .iter()
-        .find(|table| table.name == query.table)
-        .ok_or_else(ApiError::not_found)?;
     let limit = query.limit.unwrap_or(1_000).clamp(1, 10_000);
-    let rows = state
-        .database
-        .hot()
-        .rows(&dataset.id, table, query.since.as_deref(), limit)?;
+    let rows =
+        state
+            .database
+            .hot()
+            .rows(&dataset.id, &dataset.table, query.since.as_deref(), limit)?;
     Ok(Json(RowsView {
         dataset_id: dataset.id,
-        table: table.name.clone(),
-        hot_window_seconds: dataset.hot_window_seconds,
-        rows: rows.iter().map(|values| row_json(table, values)).collect(),
+        cooling: dataset.cooling,
+        rows: rows
+            .iter()
+            .map(|values| row_json(&dataset.table, values))
+            .collect(),
     }))
 }
 
@@ -551,14 +461,13 @@ struct IngestRequest {
 #[derive(Debug, Serialize)]
 struct IngestResponse {
     dataset_id: String,
-    table: String,
     upserted: i64,
     deleted: i64,
 }
 
 async fn ingest_rows(
     State(state): State<AppState>,
-    Path((dataset_id, table_name)): Path<(String, String)>,
+    Path(dataset_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ApiError> {
@@ -572,24 +481,19 @@ async fn ingest_rows(
         .database
         .dataset(&dataset_id)?
         .ok_or_else(ApiError::not_found)?;
-    let table = dataset
-        .tables
-        .iter()
-        .find(|declared| declared.name == table_name)
-        .ok_or_else(ApiError::not_found)?;
     let request: IngestRequest = serde_json::from_slice(&body)
         .map_err(|error| ApiError::bad_request(format!("invalid ingest body: {error}")))?;
     if request.upsert.is_empty() && request.delete.is_empty() {
         return Err(ApiError::bad_request("ingest carries no rows"));
     }
-    let counts =
-        state
-            .database
-            .hot()
-            .ingest(&dataset.id, table, &request.upsert, &request.delete)?;
+    let counts = state.database.hot().ingest(
+        &dataset.id,
+        &dataset.table,
+        &request.upsert,
+        &request.delete,
+    )?;
     state.database.record_ingest_event(
         &dataset.id,
-        &table.name,
         counts.upserted,
         counts.deleted,
         &token.id,
@@ -600,7 +504,6 @@ async fn ingest_rows(
         .touch_write_token(&token.id, Utc::now().timestamp())?;
     Ok(Json(IngestResponse {
         dataset_id: dataset.id,
-        table: table.name.clone(),
         upserted: counts.upserted,
         deleted: counts.deleted,
     }))
@@ -610,7 +513,6 @@ async fn ingest_rows(
 struct SyncerInput {
     name: String,
     dataset_id: String,
-    table_name: Option<String>,
 }
 
 async fn list_syncers(
@@ -639,19 +541,9 @@ async fn create_syncer(
         .database
         .dataset(&input.dataset_id)?
         .ok_or_else(ApiError::not_found)?;
-    let table_name = input
-        .table_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(table) = table_name
-        && !dataset.tables.iter().any(|declared| declared.name == table)
-    {
-        return Err(ApiError::bad_request("unknown table"));
-    }
     let syncer = state
         .database
-        .create_syncer(&principal.subject, name, &dataset.id, table_name)?;
+        .create_syncer(&principal.subject, name, &dataset.id)?;
     Ok((StatusCode::CREATED, Json(syncer)))
 }
 
@@ -987,6 +879,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::dataset_view;
+    use crate::cooling::{Cadence, CoolingSpec};
     use crate::db::Database;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
@@ -1000,7 +893,6 @@ mod tests {
 
     fn klines() -> TableSpec {
         TableSpec {
-            name: "klines".to_owned(),
             primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
             time_column: "updated_at".to_owned(),
             granularity: Granularity::Day,
@@ -1013,11 +905,20 @@ mod tests {
     }
 
     #[test]
-    fn the_dataset_view_separates_the_hot_window_from_the_cold_tree() {
+    fn the_dataset_view_separates_the_hot_store_from_the_cold_tree() {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset("bars", "Bars", "", 0, &[klines()])
+            .create_dataset(
+                "bars",
+                "Bars",
+                "",
+                &CoolingSpec {
+                    cadence: Cadence::Daily,
+                    timezone: "UTC".to_owned(),
+                },
+                &klines(),
+            )
             .expect("dataset creates");
         let table = klines();
         database
@@ -1040,23 +941,21 @@ mod tests {
             .expect("ingest");
 
         let view = dataset_view(&database, "bars").expect("view");
-        assert_eq!(view.hot_rows, 2);
+        assert_eq!(view.table.rows, 2);
         assert_eq!(
-            view.coolable_rows, 1,
-            "a zero window cools everything older than today"
+            view.table.coolable_rows, 1,
+            "only rows older than the current period may cool"
         );
-        assert_eq!(view.cold_files, 0);
-        let table_view = &view.tables[0];
-        assert_eq!(table_view.rows, 2);
-        assert_eq!(table_view.granularity, Granularity::Day);
+        assert_eq!(view.table.cold_files, 0);
+        assert_eq!(view.table.granularity, Granularity::Day);
         assert_eq!(
-            table_view.oldest_time.as_deref(),
+            view.table.oldest_time.as_deref(),
             Some("2026-09-01T00:00:00.000000Z")
         );
         assert_eq!(
-            table_view.newest_time.as_deref(),
+            view.table.newest_time.as_deref(),
             Some("2999-01-01T00:00:00.000000Z")
         );
-        assert!(table_view.cold_from.is_none());
+        assert!(view.table.cold_from.is_none());
     }
 }

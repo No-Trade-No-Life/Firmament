@@ -5,7 +5,8 @@ import { Link } from "react-router-dom"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { request, type AuthSdk } from "../lib/api"
-import { formatBytes, formatWindow } from "../lib/format"
+import { formatBytes } from "../lib/format"
+import { cadenceLabel } from "../lib/i18n"
 import type { Copy } from "../lib/i18n"
 import type { DatasetView } from "../lib/types"
 
@@ -14,9 +15,9 @@ export function OverviewPage({ auth, t }: { auth: AuthSdk; t: Copy }) {
   const list = datasets.data ?? []
   const totals = list.reduce(
     (accumulator, dataset) => ({
-      hot: accumulator.hot + dataset.hot_rows,
-      coldFiles: accumulator.coldFiles + dataset.cold_files,
-      coldBytes: accumulator.coldBytes + dataset.cold_bytes,
+      hot: accumulator.hot + dataset.table.rows,
+      coldFiles: accumulator.coldFiles + dataset.table.cold_files,
+      coldBytes: accumulator.coldBytes + dataset.table.cold_bytes,
     }),
     { hot: 0, coldFiles: 0, coldBytes: 0 },
   )
@@ -26,7 +27,7 @@ export function OverviewPage({ auth, t }: { auth: AuthSdk; t: Copy }) {
       <h1 className="m-0 text-2xl font-semibold tracking-tight">{t.overviewTitle}</h1>
       <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t.overviewSubtitle}</p>
     </div>
-    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
       <StatCard icon={DatabaseIcon} label={t.statDatasets} value={String(list.length)} />
       <StatCard icon={ThermometerIcon} label={t.statHotRows} value={totals.hot.toLocaleString()} />
       <StatCard icon={TableIcon} label={t.statColdFiles} value={totals.coldFiles.toLocaleString()} />
@@ -39,17 +40,17 @@ export function OverviewPage({ auth, t }: { auth: AuthSdk; t: Copy }) {
           {list.length === 0 ? <p className="text-sm text-muted-foreground">{t.noDatasets}</p> : <Table>
             <TableHeader><TableRow>
               <TableHead>{t.datasets}</TableHead>
-              <TableHead>{t.hotWindow}</TableHead>
+              <TableHead>{t.coolingTitle}</TableHead>
               <TableHead>{t.hotRows}</TableHead>
               <TableHead>{t.coldFiles}</TableHead>
               <TableHead>{t.coldBytes}</TableHead>
             </TableRow></TableHeader>
             <TableBody>{list.map((dataset) => <TableRow key={dataset.id}>
               <TableCell><Link className="font-medium hover:underline" to={`/datasets/${dataset.id}`}>{dataset.name}</Link></TableCell>
-              <TableCell className="text-muted-foreground">{formatWindow(dataset.hot_window_seconds)}</TableCell>
-              <TableCell>{dataset.hot_rows.toLocaleString()}</TableCell>
-              <TableCell>{dataset.cold_files}</TableCell>
-              <TableCell className="text-muted-foreground">{formatBytes(dataset.cold_bytes)}</TableCell>
+              <TableCell className="text-muted-foreground">{cadenceLabel(dataset.cooling.cadence, t)} · {dataset.cooling.timezone}</TableCell>
+              <TableCell>{dataset.table.rows.toLocaleString()}</TableCell>
+              <TableCell>{dataset.table.cold_files}</TableCell>
+              <TableCell className="text-muted-foreground">{formatBytes(dataset.table.cold_bytes)}</TableCell>
             </TableRow>)}</TableBody>
           </Table>}
         </CardContent>

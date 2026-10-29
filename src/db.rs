@@ -14,13 +14,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cooling::{Cadence, CoolingSpec};
 use crate::crypto::{Cipher, CipherError};
 use crate::hot::HotStore;
 use crate::schema::{self, TableSpec};
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "4";
 
-/// One dataset: a declared schema, a hot window length and a cold catalog.
+/// One dataset: one declared table, its cooling calendar and a cold catalog.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Dataset {
     /// Slug identifying the dataset.
@@ -29,14 +30,14 @@ pub struct Dataset {
     pub name: String,
     /// Free-form description.
     pub description: String,
-    /// How long data stays available for writing and reading in the hot window.
-    pub hot_window_seconds: i64,
+    /// When the hot window rolls over, in which calendar.
+    pub cooling: CoolingSpec,
     /// Sequence number of the last committed flush batch.
     pub last_batch: i64,
     /// Creation timestamp.
     pub created_at: i64,
-    /// Declared tables.
-    pub tables: Vec<TableSpec>,
+    /// The one table the dataset declares.
+    pub table: TableSpec,
 }
 
 /// One immutable Parquet file in the cold tree.
@@ -46,8 +47,6 @@ pub struct ColdFile {
     pub dataset_id: String,
     /// Flush batch that produced the file.
     pub batch: i64,
-    /// Table the rows belong to.
-    pub table_name: String,
     /// Dataset-relative object path, also the local mirror path.
     pub path: String,
     /// Partition key (`day=2026-10-01`).
@@ -66,14 +65,12 @@ pub struct ColdFile {
     pub created_at: i64,
 }
 
-/// Cold storage totals of one table.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ColdTableSummary {
-    /// Table name.
-    pub table_name: String,
-    /// Files catalogued for the table.
+/// Cold storage totals of a dataset.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ColdSummary {
+    /// Files catalogued for the dataset.
     pub files: i64,
-    /// Bytes catalogued for the table.
+    /// Bytes catalogued for the dataset.
     pub bytes: u64,
     /// Oldest timestamp in cold storage.
     pub earliest_time: Option<String>,
@@ -108,7 +105,7 @@ pub struct Flush {
     pub finished_at: Option<i64>,
 }
 
-/// A user's mirror subscription of one dataset (optionally one table).
+/// A user's mirror subscription of one dataset.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Syncer {
     /// Syncer id.
@@ -119,8 +116,6 @@ pub struct Syncer {
     pub name: String,
     /// Mirrored dataset.
     pub dataset_id: String,
-    /// Optional single-table filter.
-    pub table_name: Option<String>,
     /// Last flush batch this mirror saw.
     pub last_batch: i64,
     /// Creation timestamp.
@@ -190,8 +185,6 @@ pub struct IngestEvent {
     pub id: String,
     /// Dataset written to.
     pub dataset_id: String,
-    /// Table written to.
-    pub table_name: String,
     /// Rows upserted.
     pub upserted: i64,
     /// Rows deleted.
@@ -271,7 +264,8 @@ impl Database {
                 name TEXT NOT NULL,
                 description TEXT NOT NULL,
                 spec TEXT NOT NULL,
-                hot_window_seconds INTEGER NOT NULL,
+                cadence TEXT NOT NULL,
+                timezone TEXT NOT NULL,
                 last_batch INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
@@ -293,7 +287,6 @@ impl Database {
             CREATE TABLE IF NOT EXISTS cold_files (
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
                 batch INTEGER NOT NULL,
-                table_name TEXT NOT NULL,
                 path TEXT NOT NULL,
                 partition TEXT NOT NULL,
                 rows INTEGER NOT NULL,
@@ -310,7 +303,6 @@ impl Database {
                 owner_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 dataset_id TEXT NOT NULL REFERENCES datasets(id),
-                table_name TEXT,
                 last_batch INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_synced_at INTEGER
@@ -336,7 +328,6 @@ impl Database {
             CREATE TABLE IF NOT EXISTS ingest_events (
                 id TEXT PRIMARY KEY NOT NULL,
                 dataset_id TEXT NOT NULL,
-                table_name TEXT NOT NULL,
                 upserted INTEGER NOT NULL,
                 deleted INTEGER NOT NULL,
                 token_id TEXT NOT NULL,
@@ -399,26 +390,26 @@ impl Database {
         id: &str,
         name: &str,
         description: &str,
-        hot_window_seconds: i64,
-        tables: &[TableSpec],
+        cooling: &CoolingSpec,
+        table: &TableSpec,
     ) -> Result<Dataset, DatabaseError> {
-        schema::validate(tables).map_err(DatabaseError::Conflict)?;
-        let spec = serde_json::to_string(tables).map_err(|error| {
+        schema::validate(table).map_err(DatabaseError::Conflict)?;
+        let spec = serde_json::to_string(table).map_err(|error| {
             DatabaseError::Files(std::io::Error::other(format!(
                 "schema encoding failed: {error}"
             )))
         })?;
         let created_at = Utc::now().timestamp();
         let inserted = self.connection()?.execute(
-            "INSERT INTO datasets(id, name, description, spec, hot_window_seconds, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(id) DO NOTHING",
-            params![id, name, description, spec, hot_window_seconds, created_at],
+            "INSERT INTO datasets(id, name, description, spec, cadence, timezone, last_batch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7) ON CONFLICT(id) DO NOTHING",
+            params![id, name, description, spec, cooling.cadence.as_str(), cooling.timezone, created_at],
         )?;
         if inserted == 0 {
             return Err(DatabaseError::Conflict(format!(
                 "dataset {id} already exists"
             )));
         }
-        if let Err(error) = self.hot.create(id, tables) {
+        if let Err(error) = self.hot.create(id, table) {
             let _ = self
                 .connection()?
                 .execute("DELETE FROM datasets WHERE id = ?1", [id]);
@@ -428,17 +419,17 @@ impl Database {
             id: id.to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
-            hot_window_seconds,
+            cooling: cooling.clone(),
             last_batch: 0,
             created_at,
-            tables: tables.to_vec(),
+            table: table.clone(),
         })
     }
 
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, name, description, spec, hot_window_seconds, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
+            "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets ORDER BY created_at ASC, id ASC",
         )?;
         let datasets = statement
             .query_map([], dataset_from_row)?
@@ -449,7 +440,7 @@ impl Database {
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, name, description, spec, hot_window_seconds, last_batch, created_at FROM datasets WHERE id = ?1",
+                "SELECT id, name, description, spec, cadence, timezone, last_batch, created_at FROM datasets WHERE id = ?1",
                 [id],
                 dataset_from_row,
             )
@@ -523,11 +514,10 @@ impl Database {
         let transaction = connection.transaction()?;
         for file in files {
             transaction.execute(
-                "INSERT INTO cold_files(dataset_id, batch, table_name, path, partition, rows, bytes, sha256, min_time, max_time, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(dataset_id, path) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes, sha256 = excluded.sha256, min_time = excluded.min_time, max_time = excluded.max_time",
+                "INSERT INTO cold_files(dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(dataset_id, path) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes, sha256 = excluded.sha256, min_time = excluded.min_time, max_time = excluded.max_time",
                 params![
                     dataset_id,
                     batch,
-                    file.table_name,
                     file.path,
                     file.partition,
                     file.rows,
@@ -595,14 +585,13 @@ impl Database {
         &self,
         dataset_id: &str,
         since_batch: i64,
-        table: Option<&str>,
     ) -> Result<Vec<ColdFile>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT dataset_id, batch, table_name, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND batch > ?2 AND (?3 IS NULL OR table_name = ?3) ORDER BY batch ASC, path ASC",
+            "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND batch > ?2 ORDER BY batch ASC, path ASC",
         )?;
         statement
-            .query_map(params![dataset_id, since_batch, table], cold_file_from_row)?
+            .query_map(params![dataset_id, since_batch], cold_file_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
     }
@@ -619,7 +608,7 @@ impl Database {
     ) -> Result<Option<ColdFile>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT dataset_id, batch, table_name, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
+                "SELECT dataset_id, batch, path, partition, rows, bytes, sha256, min_time, max_time, created_at FROM cold_files WHERE dataset_id = ?1 AND path = ?2",
                 params![dataset_id, path],
                 cold_file_from_row,
             )
@@ -629,7 +618,7 @@ impl Database {
 
     pub fn list_syncers(&self, owner_id: Option<&str>) -> Result<Vec<Syncer>, DatabaseError> {
         let connection = self.connection()?;
-        let columns = "SELECT id, owner_id, name, dataset_id, table_name, last_batch, created_at, last_synced_at FROM syncers";
+        let columns = "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers";
         match owner_id {
             Some(owner_id) => {
                 let mut statement = connection.prepare(&format!(
@@ -654,7 +643,7 @@ impl Database {
     pub fn get_syncer(&self, id: &str) -> Result<Option<Syncer>, DatabaseError> {
         self.connection()?
             .query_row(
-                "SELECT id, owner_id, name, dataset_id, table_name, last_batch, created_at, last_synced_at FROM syncers WHERE id = ?1",
+                "SELECT id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at FROM syncers WHERE id = ?1",
                 [id],
                 syncer_from_row,
             )
@@ -667,21 +656,19 @@ impl Database {
         owner_id: &str,
         name: &str,
         dataset_id: &str,
-        table_name: Option<&str>,
     ) -> Result<Syncer, DatabaseError> {
         let syncer = Syncer {
             id: Uuid::new_v4().to_string(),
             owner_id: owner_id.to_owned(),
             name: name.to_owned(),
             dataset_id: dataset_id.to_owned(),
-            table_name: table_name.map(str::to_owned),
             last_batch: 0,
             created_at: Utc::now().timestamp(),
             last_synced_at: None,
         };
         self.connection()?.execute(
-            "INSERT INTO syncers(id, owner_id, name, dataset_id, table_name, last_batch, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.table_name, syncer.last_batch, syncer.created_at],
+            "INSERT INTO syncers(id, owner_id, name, dataset_id, last_batch, created_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![syncer.id, syncer.owner_id, syncer.name, syncer.dataset_id, syncer.last_batch, syncer.created_at],
         )?;
         Ok(syncer)
     }
@@ -883,15 +870,14 @@ impl Database {
     pub fn record_ingest_event(
         &self,
         dataset_id: &str,
-        table_name: &str,
         upserted: i64,
         deleted: i64,
         token_id: &str,
         token_name: &str,
     ) -> Result<(), DatabaseError> {
         self.connection()?.execute(
-            "INSERT INTO ingest_events(id, dataset_id, table_name, upserted, deleted, token_id, token_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![Uuid::new_v4().to_string(), dataset_id, table_name, upserted, deleted, token_id, token_name, Utc::now().timestamp()],
+            "INSERT INTO ingest_events(id, dataset_id, upserted, deleted, token_id, token_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![Uuid::new_v4().to_string(), dataset_id, upserted, deleted, token_id, token_name, Utc::now().timestamp()],
         )?;
         Ok(())
     }
@@ -899,7 +885,7 @@ impl Database {
     pub fn list_ingest_events(&self, limit: i64) -> Result<Vec<IngestEvent>, DatabaseError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, dataset_id, table_name, upserted, deleted, token_id, token_name, created_at FROM ingest_events ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+            "SELECT id, dataset_id, upserted, deleted, token_id, token_name, created_at FROM ingest_events ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         statement
             .query_map([limit], ingest_event_from_row)?
@@ -907,33 +893,31 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
-    /// Summarises the cold tree per table.
+    /// Summarises the cold tree of a dataset.
     ///
     /// # Errors
     ///
     /// Returns an error when the catalog cannot be read.
-    pub fn cold_summary(&self, dataset_id: &str) -> Result<Vec<ColdTableSummary>, DatabaseError> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT table_name, COUNT(*), COALESCE(SUM(bytes), 0), MIN(min_time), MAX(max_time) FROM cold_files WHERE dataset_id = ?1 GROUP BY table_name",
-        )?;
-        statement
-            .query_map([dataset_id], |row| {
-                Ok(ColdTableSummary {
-                    table_name: row.get(0)?,
-                    files: row.get(1)?,
-                    bytes: row.get::<_, i64>(2)?.max(0) as u64,
-                    earliest_time: row.get(3)?,
-                    latest_time: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+    pub fn cold_summary(&self, dataset_id: &str) -> Result<ColdSummary, DatabaseError> {
+        self.connection()?
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MIN(min_time), MAX(max_time) FROM cold_files WHERE dataset_id = ?1",
+                [dataset_id],
+                |row| {
+                    Ok(ColdSummary {
+                        files: row.get(0)?,
+                        bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                        earliest_time: row.get(2)?,
+                        latest_time: row.get(3)?,
+                    })
+                },
+            )
             .map_err(DatabaseError::Sqlite)
     }
 
     fn reapply_schemas(&self) -> Result<(), DatabaseError> {
         for dataset in self.list_datasets()? {
-            self.hot.apply_schema(&dataset.id, &dataset.tables)?;
+            self.hot.apply_schema(&dataset.id, &dataset.table)?;
         }
         Ok(())
     }
@@ -953,21 +937,31 @@ impl Database {
 
 fn dataset_from_row(row: &Row<'_>) -> rusqlite::Result<Dataset> {
     let spec: String = row.get(3)?;
-    let tables = serde_json::from_str(&spec).map_err(|error| {
+    let table = serde_json::from_str(&spec).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             3,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::other(error.to_string())),
         )
     })?;
+    let cadence: String = row.get(4)?;
     Ok(Dataset {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
-        tables,
-        hot_window_seconds: row.get(4)?,
-        last_batch: row.get(5)?,
-        created_at: row.get(6)?,
+        table,
+        cooling: CoolingSpec {
+            cadence: Cadence::parse(&cadence).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(format!("unknown cadence {cadence}"))),
+                )
+            })?,
+            timezone: row.get(5)?,
+        },
+        last_batch: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -977,10 +971,9 @@ fn syncer_from_row(row: &Row<'_>) -> rusqlite::Result<Syncer> {
         owner_id: row.get(1)?,
         name: row.get(2)?,
         dataset_id: row.get(3)?,
-        table_name: row.get(4)?,
-        last_batch: row.get(5)?,
-        created_at: row.get(6)?,
-        last_synced_at: row.get(7)?,
+        last_batch: row.get(4)?,
+        created_at: row.get(5)?,
+        last_synced_at: row.get(6)?,
     })
 }
 
@@ -997,12 +990,11 @@ fn ingest_event_from_row(row: &Row<'_>) -> rusqlite::Result<IngestEvent> {
     Ok(IngestEvent {
         id: row.get(0)?,
         dataset_id: row.get(1)?,
-        table_name: row.get(2)?,
-        upserted: row.get(3)?,
-        deleted: row.get(4)?,
-        token_id: row.get(5)?,
-        token_name: row.get(6)?,
-        created_at: row.get(7)?,
+        upserted: row.get(2)?,
+        deleted: row.get(3)?,
+        token_id: row.get(4)?,
+        token_name: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -1026,15 +1018,14 @@ fn cold_file_from_row(row: &Row<'_>) -> rusqlite::Result<ColdFile> {
     Ok(ColdFile {
         dataset_id: row.get(0)?,
         batch: row.get(1)?,
-        table_name: row.get(2)?,
-        path: row.get(3)?,
-        partition: row.get(4)?,
-        rows: row.get(5)?,
-        bytes: row.get::<_, i64>(6)?.max(0) as u64,
-        sha256: row.get(7)?,
-        min_time: row.get(8)?,
-        max_time: row.get(9)?,
-        created_at: row.get(10)?,
+        path: row.get(2)?,
+        partition: row.get(3)?,
+        rows: row.get(4)?,
+        bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        sha256: row.get(6)?,
+        min_time: row.get(7)?,
+        max_time: row.get(8)?,
+        created_at: row.get(9)?,
     })
 }
 
@@ -1086,7 +1077,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::Database;
+    use crate::cooling::{Cadence, CoolingSpec};
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
+
+    fn daily() -> CoolingSpec {
+        CoolingSpec {
+            cadence: Cadence::Daily,
+            timezone: "Asia/Shanghai".to_owned(),
+        }
+    }
 
     fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
         ColumnSpec {
@@ -1098,7 +1097,6 @@ mod tests {
 
     fn bars() -> TableSpec {
         TableSpec {
-            name: "bars".to_owned(),
             primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
             time_column: "updated_at".to_owned(),
             granularity: Granularity::Day,
@@ -1117,20 +1115,19 @@ mod tests {
         assert!(database.list_datasets().expect("list").is_empty());
 
         let dataset = database
-            .create_dataset("bars", "Bars", "test", 86_400, &[bars()])
+            .create_dataset("bars", "Bars", "test", &daily(), &bars())
             .expect("dataset creates");
-        assert_eq!(dataset.hot_window_seconds, 86_400);
+        assert_eq!(dataset.cooling.timezone, "Asia/Shanghai");
         assert_eq!(dataset.last_batch, 0);
         assert!(
             database
-                .create_dataset("bars", "Bars", "test", 86_400, &[bars()])
+                .create_dataset("bars", "Bars", "test", &daily(), &bars())
                 .is_err(),
             "ids are unique"
         );
 
         let stored = database.dataset("bars").expect("read").expect("exists");
-        assert_eq!(stored.tables[0].name, "bars");
-        assert_eq!(stored.tables[0].granularity, Granularity::Day);
+        assert_eq!(stored.table.granularity, Granularity::Day);
     }
 
     #[test]
@@ -1138,7 +1135,7 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset("bars", "Bars", "", 3600, &[bars()])
+            .create_dataset("bars", "Bars", "", &daily(), &bars())
             .expect("dataset creates");
 
         let first = database.begin_flush("bars", "schedule").expect("first");
@@ -1175,13 +1172,12 @@ mod tests {
         let state = TempDir::new().expect("state directory");
         let database = Database::open(state.path()).expect("database opens");
         database
-            .create_dataset("bars", "Bars", "", 3600, &[bars()])
+            .create_dataset("bars", "Bars", "", &daily(), &bars())
             .expect("dataset creates");
         let file = super::ColdFile {
             dataset_id: "bars".to_owned(),
             batch: 1,
-            table_name: "bars".to_owned(),
-            path: "bars/day=2026-10-01/000001-0000.parquet".to_owned(),
+            path: "day=2026-10-01/000001-0000.parquet".to_owned(),
             partition: "day=2026-10-01".to_owned(),
             rows: 3,
             bytes: 42,
@@ -1194,17 +1190,17 @@ mod tests {
             .record_batch("bars", 1, std::slice::from_ref(&file))
             .expect("records");
 
-        assert_eq!(database.cold_files("bars", 0, None).expect("all").len(), 1);
+        assert_eq!(database.cold_files("bars", 0).expect("all").len(), 1);
         assert!(
             database
-                .cold_files("bars", 1, None)
+                .cold_files("bars", 1)
                 .expect("incremental")
                 .is_empty(),
             "since is exclusive"
         );
         assert_eq!(
             database
-                .cold_file("bars", "bars/day=2026-10-01/000001-0000.parquet")
+                .cold_file("bars", "day=2026-10-01/000001-0000.parquet")
                 .expect("lookup")
                 .expect("exists")
                 .rows,
@@ -1227,7 +1223,7 @@ mod tests {
         broken.primary_key.clear();
         assert!(
             database
-                .create_dataset("bars", "Bars", "", 60, &[broken])
+                .create_dataset("bars", "Bars", "", &daily(), &broken)
                 .is_err()
         );
         assert!(database.list_datasets().expect("list").is_empty());

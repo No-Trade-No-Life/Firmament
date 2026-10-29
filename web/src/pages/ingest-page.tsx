@@ -1,6 +1,13 @@
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { CopyIcon, PlusIcon, Trash2Icon } from "lucide-react"
+import {
+  createColumnHelper,
+  createPaginatedRowModel,
+  rowPaginationFeature,
+  tableFeatures,
+  useTable,
+} from "@tanstack/react-table"
 import { toast } from "sonner"
 
 import {
@@ -19,10 +26,43 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Pager } from "../components/pager"
 import { request, type AuthSdk } from "../lib/api"
 import { formatTime, showError } from "../lib/format"
 import type { Copy } from "../lib/i18n"
 import type { IngestEvent, WriteToken, WriteTokenCreated } from "../lib/types"
+
+const auditFeatures = tableFeatures({
+  rowPaginationFeature,
+  paginatedRowModel: createPaginatedRowModel(),
+})
+
+const auditColumns = createColumnHelper<typeof auditFeatures, IngestEvent>()
+
+function IngestEventsTable({ events, locale, t }: { events: IngestEvent[]; locale: string; t: Copy }) {
+  const columns = useMemo(() => auditColumns.columns([
+    auditColumns.accessor("created_at", { header: () => t.ingestEventTime, cell: (info) => formatTime(info.getValue(), locale) }),
+    auditColumns.accessor("token_name", { header: () => t.ingestEventPublisher }),
+    auditColumns.accessor("dataset_id", { header: () => t.ingestEventDataset, cell: (info) => <span className="font-mono text-xs">{info.getValue()}</span> }),
+    auditColumns.accessor("upserted", { header: () => t.ingestEventUpserts }),
+    auditColumns.accessor("deleted", { header: () => t.ingestEventDeletes }),
+  ]), [t, locale])
+  const table = useTable({ features: auditFeatures, columns, data: events, initialState: { pagination: { pageIndex: 0, pageSize: 10 } } })
+  if (events.length === 0) return <p className="text-sm text-muted-foreground">{t.noIngestEvents}</p>
+  return <>
+    <Table>
+      <TableHeader>{table.getHeaderGroups().map((group) => <TableRow key={group.id}>
+        {group.headers.map((header) => <TableHead key={header.id}>
+          {header.isPlaceholder ? null : <table.FlexRender header={header} />}
+        </TableHead>)}
+      </TableRow>)}</TableHeader>
+      <TableBody>{table.getRowModel().rows.map((row) => <TableRow key={row.id}>
+        {row.getAllCells().map((cell) => <TableCell key={cell.id}><table.FlexRender cell={cell} /></TableCell>)}
+      </TableRow>)}</TableBody>
+    </Table>
+    <Pager table={table} label={`${events.length} ${t.records}`} />
+  </>
+}
 
 export function IngestPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t: Copy }) {
   const queryClient = useQueryClient()
@@ -100,24 +140,7 @@ export function IngestPage({ auth, locale, t }: { auth: AuthSdk; locale: string;
         <CardDescription>{t.ingestEventsDescription}</CardDescription>
       </CardHeader>
       <CardContent>
-        {(events.data ?? []).length === 0 ? <p className="text-sm text-muted-foreground">{t.noIngestEvents}</p> : <Table>
-          <TableHeader><TableRow>
-            <TableHead>{t.ingestEventTime}</TableHead>
-            <TableHead>{t.ingestEventPublisher}</TableHead>
-            <TableHead>{t.ingestEventDataset}</TableHead>
-            <TableHead>{t.ingestEventTable}</TableHead>
-            <TableHead>{t.ingestEventUpserts}</TableHead>
-            <TableHead>{t.ingestEventDeletes}</TableHead>
-          </TableRow></TableHeader>
-          <TableBody>{(events.data ?? []).map((event) => <TableRow key={event.id}>
-            <TableCell className="text-muted-foreground">{formatTime(event.created_at, locale)}</TableCell>
-            <TableCell>{event.token_name}</TableCell>
-            <TableCell className="font-mono text-xs">{event.dataset_id}</TableCell>
-            <TableCell className="font-mono text-xs">{event.table_name}</TableCell>
-            <TableCell>{event.upserted}</TableCell>
-            <TableCell>{event.deleted}</TableCell>
-          </TableRow>)}</TableBody>
-        </Table>}
+        <IngestEventsTable events={events.data ?? []} locale={locale} t={t} />
       </CardContent>
     </Card>
 

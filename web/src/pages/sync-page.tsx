@@ -34,30 +34,25 @@ import {
   type SyncProgress,
 } from "../lib/sync"
 
-const ALL_TABLES = "__all__"
-
 export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t: Copy }) {
   const queryClient = useQueryClient()
   const syncers = useQuery({ queryKey: ["syncers"], queryFn: () => request<Syncer[]>("/api/v1/syncers", auth) })
   const datasets = useQuery({ queryKey: ["datasets"], queryFn: () => request<DatasetView[]>("/api/v1/datasets", auth) })
   const [name, setName] = useState("")
   const [datasetId, setDatasetId] = useState("")
-  const [tableName, setTableName] = useState(ALL_TABLES)
   const [progress, setProgress] = useState<Record<string, SyncProgress>>({})
   const [busy, setBusy] = useState<string | null>(null)
   const [removing, setRemoving] = useState<Syncer | null>(null)
   const supported = supportsDirectorySync()
   const list = syncers.data ?? []
-  const selected = (datasets.data ?? []).find((dataset) => dataset.id === datasetId)
 
   const create = useMutation({
     mutationFn: () => request<Syncer>("/api/v1/syncers", auth, {
       method: "POST",
-      body: JSON.stringify({ name, dataset_id: datasetId, table_name: tableName === ALL_TABLES ? null : tableName }),
+      body: JSON.stringify({ name, dataset_id: datasetId }),
     }),
     onSuccess: () => {
       setName("")
-      setTableName(ALL_TABLES)
       void queryClient.invalidateQueries({ queryKey: ["syncers"] })
     },
     onError: showError,
@@ -85,7 +80,6 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
       // Incremental by batch: the manifest only carries what this mirror has not
       // seen yet, so a repeated sync downloads nothing.
       const query = new URLSearchParams({ since: String(syncer.last_batch) })
-      if (syncer.table_name) query.set("table", syncer.table_name)
       const manifest = await request<Manifest>(`/api/v1/datasets/${syncer.dataset_id}/manifest?${query.toString()}`, auth)
       const summary = await runSync({
         directory: handle,
@@ -119,26 +113,16 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
       <CardContent>
         <form className="flex flex-col gap-4" onSubmit={(event) => { event.preventDefault(); create.mutate() }}>
           <FieldGroup>
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-2">
               <Field>
                 <FieldLabel htmlFor="syncer-name">{t.syncerName}</FieldLabel>
                 <Input id="syncer-name" value={name} onChange={(event) => setName(event.target.value)} required />
               </Field>
               <Field>
                 <FieldLabel>{t.syncerDataset}</FieldLabel>
-                <Select value={datasetId} onValueChange={(value) => { setDatasetId(value ?? ""); setTableName(ALL_TABLES) }}>
+                <Select value={datasetId} onValueChange={(value) => setDatasetId(value ?? "")}>
                   <SelectTrigger><SelectValue placeholder={t.chooseDataset} /></SelectTrigger>
                   <SelectContent>{(datasets.data ?? []).map((dataset) => <SelectItem key={dataset.id} value={dataset.id}>{dataset.name}</SelectItem>)}</SelectContent>
-                </Select>
-              </Field>
-              <Field>
-                <FieldLabel>{t.syncerTable}</FieldLabel>
-                <Select value={tableName} onValueChange={(value) => setTableName(value ?? ALL_TABLES)} disabled={!selected}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_TABLES}>{t.allTables}</SelectItem>
-                    {(selected?.tables ?? []).map((table) => <SelectItem key={table.name} value={table.name}>{table.name}</SelectItem>)}
-                  </SelectContent>
                 </Select>
               </Field>
             </div>
@@ -156,7 +140,6 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
           <TableHeader><TableRow>
             <TableHead>{t.syncerName}</TableHead>
             <TableHead>{t.syncerDataset}</TableHead>
-            <TableHead>{t.syncerTable}</TableHead>
             <TableHead>{t.mirroredBatch}</TableHead>
             <TableHead>{t.lastSynced}</TableHead>
             <TableHead className="text-right" />
@@ -166,7 +149,6 @@ export function SyncPage({ auth, locale, t }: { auth: AuthSdk; locale: string; t
             return <TableRow key={syncer.id}>
               <TableCell className="font-medium">{syncer.name}</TableCell>
               <TableCell className="font-mono text-xs">{syncer.dataset_id}</TableCell>
-              <TableCell className="font-mono text-xs">{syncer.table_name ?? t.allTables}</TableCell>
               <TableCell className="font-mono text-xs">{syncer.last_batch}</TableCell>
               <TableCell className="text-muted-foreground">
                 {syncer.last_synced_at ? formatTime(syncer.last_synced_at, locale) : t.neverSynced}

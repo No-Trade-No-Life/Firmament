@@ -225,8 +225,8 @@ export async function runSync(params: {
   }
   onProgress({ phase: "downloading", total: planned.length, completed: planned.length, current: "" })
 
-  // Files that left the selection (a narrower table filter, say) are the only
-  // thing a sync ever removes; cold objects themselves are immutable.
+  // Files that dropped out of the manifest are the only thing a sync ever
+  // removes; cold objects themselves are immutable.
   const keep = new Set(files.map((file) => file.path))
   const removals = [...previous.keys()].filter((path) => !keep.has(path))
   onProgress({ phase: "cleaning", total: removals.length, completed: 0, current: "" })

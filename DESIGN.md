@@ -1,12 +1,12 @@
 # Design
 
-一个数据集同时有两半：**热窗口**（一个可写的 SQLite）和**冷库**（只追加的 Parquet 树）。
-时间往前走，冷却线跟着往前推，跨过线的行从热窗口搬进冷库。Firmament 不存任意文件、
-不提供查询引擎，它只做这一件事。
+一个数据集就是一张表，同一份 schema 同时有两种存储形态：**热库**（一个可写的 SQLite，
+装当前日历周期）和**冷库**（只追加的 Parquet 树）。日历往前走，冷却线往前推，早于线的行
+从热库导出到冷库。Firmament 不存任意文件、不提供查询引擎，它只做这一件事。
 
 ```
-数据集  │←──── 冷：Parquet，只追加 ────│←── 热：SQLite，可写可改 ──→│
-                                   冷却线 = now - 热窗口
+数据集（一张表）  │←──── 冷：Parquet，只追加 ────│←── 热：SQLite，可写可改 ──→│
+                                     冷却线 = truncate_to_cadence(now, timezone)
 ```
 
 ## 表结构
@@ -16,55 +16,64 @@
 - **主键**（必填）：定义"同一行"。写入按主键 upsert，因此没有主键就没有"改"。
 - **时间列**（必填）：`timestamp` 类型，不可为空，必须包含在主键里，由**写入方**提供。
   它是这条信息产生的时间，同时是冷却的轴、Parquet 的分区依据、以及冷库里判定版本先后的依据。
-- **分区粒度**（必填）：`hour` / `day` / `month`，每张表可以不同。
+- **分区粒度**（必填）：`hour` / `day` / `month`。
 - **列**（必填）：`integer` / `real` / `text` / `boolean` / `timestamp`，可选 `nullable`。
 
 时间戳统一归一化成固定宽度的 UTC 微秒（`2026-10-01T05:45:12.000000Z`），文本序即时间序。
 
+热库为每个数据集只建一张 `data` 表（外加主键唯一索引与时间列索引）：一个数据集就是一张
+二维表，没有跨表事务，也没有需要命名的表。
+
 ## 写入
 
-`POST /api/v1/ingest/{dataset}/{table}`，`Authorization: Bearer <写 token>`：
+`POST /api/v1/ingest/{dataset}`，`Authorization: Bearer <写 token>`：
 
 ```json
 { "upsert": [{ "symbol": "BTCUSDT", "updated_at": "2026-10-01T00:00:00Z", "close": 78200.5 }],
   "delete": [{ "symbol": "BTCUSDT", "updated_at": "2026-10-01T00:00:00Z" }] }
 ```
 
-热窗口里的数据可以全改：upsert 覆盖同主键的行，delete 直接删掉。删除只作用于热窗口 ——
+热库里的数据可以全改：upsert 覆盖同主键的行，delete 直接删掉。删除只作用于尚未冷却的行 ——
 已经进了冷库的行不再可改，冷库是只追加的历史。
 
 写入方给的时间戳决定冷却时机：回补给过去的时间会立刻冷却成冷库文件；写未来时间则会一直
-停在热窗口里。
+停在热库里。
 
 ## 冷却
 
-每 60 秒扫一次，对每个数据集每张表算一次冷却线：
+每 60 秒扫一次。冷却线是数据集自己日历里的当前周期起点：
 
 ```
-冷却线 = truncate(now - 热窗口, 分区粒度)
+冷却线 = truncate_to_cadence(now, timezone)
+  daily   → 当地今天 00:00
+  weekly  → 本周一 00:00
+  monthly → 本月 1 日 00:00
 ```
 
-对齐到分区边界是为了让一次冷却产出整分区，而不是每分钟一个小文件。然后：
+冷却线只由 `cadence` 与 `timezone` 决定，与分区粒度无关：粒度只决定导出时把行切进哪个桶，
+所以"每天冷却一次、按小时分区"这种组合成立，而且一轮冷却产出的仍是整桶文件。
 
-1. **认领**：`UPDATE ... SET _flush = <batch> WHERE _flush IS NULL AND <时间列> < 冷却线`。
+然后：
+
+1. **认领**：`UPDATE data SET _flush = <batch> WHERE _flush IS NULL AND <时间列> < 冷却线`。
    冷却期间写入不阻塞；如果被认领的行又被改写，写入会把 `_flush` 清空，新版本等下一轮。
 2. **导出**：按分区桶分组写 Parquet（单文件最多 50 万行），上传 S3，用 `HEAD` 校验大小与
    SHA-256。
 3. **提交**：写 `datasets/{id}/_catalog/{batch}.json`，再把这批文件登记进控制面库。这是提交点。
-4. **清空**：`DELETE ... WHERE _flush = <batch>`。
+4. **清空**：`DELETE FROM data WHERE _flush = <batch>` —— 只删已冷却的行，热库继续持有当前周期。
 
 失败语义：提交前失败 → 认领被释放，热库原封不动，下一轮重试；提交后、清空前崩溃 → 下一轮
 开头的 `_flush < batch` 清理会把它们删掉（它们已经在冷库里了）。因此是 at-least-once，
 重复的批次只会在冷库里多一份同样的数据，不会丢数据。
 
-热库的规模 = 写入速率 × 热窗口，所以"热库要小"是靠窗口长度配出来的，不是靠额外裁剪。
+热库的规模 = 写入速率 × 一个周期的长度，所以"热库要小"是靠 cadence 配出来的，不是靠额外裁剪。
 
 ## 冷库契约
 
 对象路径：
 
 ```
-datasets/{dataset}/{table}/{hour|day|month}={bucket}/{batch:06}-{seq:04}.parquet
+datasets/{dataset}/{hour|day|month}={bucket}/{batch:06}-{seq:04}.parquet
 datasets/{dataset}/_catalog/{batch:06}.json
 ```
 
@@ -77,17 +86,17 @@ datasets/{dataset}/_catalog/{batch:06}.json
 
 ## 清单与镜像
 
-`GET /api/v1/datasets/{id}/manifest?since=<batch>&table=<name>` 返回该批次之后的全部冷文件。
+`GET /api/v1/datasets/{id}/manifest?since=<batch>` 返回该批次之后的全部冷文件。
 `since` 是批次号，不是时间 —— 因为数据时间是写入方给的，回填会让旧分区出现新文件，
 按时间水位做的增量会永久漏数据。
 
 同步器（浏览器）把这份清单增量下载到用户选择的目录，本地路径与桶布局一致
-（`{dataset}/{table}/{partition}/{file}.parquet`）。文件不可变 ⇒ 镜像只增不覆盖、断点可续、
+（`{dataset}/{partition}/{file}.parquet`）。文件不可变 ⇒ 镜像只增不覆盖、断点可续、
 校验 SHA-256 后落盘。本地状态写在 `.firmament/sync.json`（已镜像批次 + 文件清单）。
 
 ## 读面
 
-- **热窗口**：`GET /api/v1/datasets/{id}/rows?table=&since=&limit=`，只返回还在热库里的行。
+- **热库**：`GET /api/v1/datasets/{id}/rows?since=&limit=`，只返回还没冷却的行（当前周期）。
 - **全量**：没有全量接口。全量 = 镜像下来的冷库，下游用自己的程序读。
 - **没有冷热混合查询**：边界是公开的冷却线，要拼自己拼。
 
@@ -95,4 +104,4 @@ datasets/{dataset}/_catalog/{batch:06}.json
 
 - 后台每 60 秒推进一次冷却；单个数据集同时只允许一轮。
 - 冷却失败后 10 分钟内不重试，避免坏桶变成忙循环。
-- 热库里"待冷却"的行数在数据集页可见；持续增长说明冷却跟不上写入。
+- 数据集页会显示热库行数与其中"待冷却"的行数；待冷却持续增长说明冷却跟不上写入。

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod cold;
+mod cooling;
 mod crypto;
 mod db;
 mod files;
@@ -24,7 +25,7 @@ use cold::{ColdStore, S3ColdStore};
 use db::Database;
 use resources::ResourceMonitor;
 
-/// How often the sweeper looks for rows that cooled out of a hot window.
+/// How often the sweeper looks for rows that cooled out of the current period.
 const COOLING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A failed pass is retried only after this long, so a broken bucket does not
@@ -130,32 +131,26 @@ async fn sweep_once(database: &Database, cold: &dyn ColdStore) {
                 continue;
             }
         }
-        let boundaries = dataset
-            .tables
-            .iter()
-            .map(|table| {
-                (
-                    table.name.clone(),
-                    flush::cooling_boundary(now, dataset.hot_window_seconds, table.granularity),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut coolable = 0_i64;
-        for table in &dataset.tables {
-            match database
-                .hot()
-                .coolable_rows(&dataset.id, table, &boundaries[&table.name])
-            {
-                Ok(rows) => coolable += rows,
-                Err(error) => {
-                    eprintln!("firmament: {} hot window unreadable: {error}", dataset.id);
-                    break;
-                }
+        let boundary = match cooling::boundary(now, &dataset.cooling) {
+            Ok(boundary) => boundary.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            Err(message) => {
+                eprintln!(
+                    "firmament: {} cooling calendar invalid: {message}",
+                    dataset.id
+                );
+                continue;
             }
-            if coolable > 0 {
-                break;
+        };
+        let coolable = match database
+            .hot()
+            .coolable_rows(&dataset.id, &dataset.table, &boundary)
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("firmament: {} hot data unreadable: {error}", dataset.id);
+                continue;
             }
-        }
+        };
         if coolable == 0 {
             continue;
         }

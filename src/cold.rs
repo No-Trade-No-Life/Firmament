@@ -288,7 +288,6 @@ mod tests {
 
     fn table() -> TableSpec {
         TableSpec {
-            name: "bars".to_owned(),
             primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
             time_column: "updated_at".to_owned(),
             granularity: Granularity::Hour,

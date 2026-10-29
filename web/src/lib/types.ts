@@ -6,6 +6,13 @@ export type Me = {
 
 export type ColumnType = "integer" | "real" | "text" | "boolean" | "timestamp"
 
+export type CoolingCadence = "daily" | "weekly" | "monthly"
+
+export type CoolingSpec = {
+  cadence: CoolingCadence
+  timezone: string
+}
+
 export type Granularity = "hour" | "day" | "month"
 
 export type ColumnSpec = {
@@ -15,7 +22,6 @@ export type ColumnSpec = {
 }
 
 export type TableSpec = {
-  name: string
   primary_key: string[]
   time_column: string
   granularity: Granularity
@@ -37,22 +43,15 @@ export type DatasetView = {
   id: string
   name: string
   description: string
-  hot_window_seconds: number
+  cooling: CoolingSpec
   last_batch: number
   created_at: number
-  tables: TableView[]
-  hot_rows: number
-  coolable_rows: number
-  cold_files: number
-  cold_bytes: number
-  cold_from: string | null
-  cold_until: string | null
+  table: TableView
 }
 
 export type ColdFile = {
   dataset_id: string
   batch: number
-  table_name: string
   path: string
   partition: string
   rows: number
@@ -95,7 +94,6 @@ export type Syncer = {
   owner_id: string
   name: string
   dataset_id: string
-  table_name: string | null
   last_batch: number
   created_at: number
   last_synced_at: number | null
@@ -129,7 +127,6 @@ export type WriteTokenCreated = WriteToken & {
 export type IngestEvent = {
   id: string
   dataset_id: string
-  table_name: string
   upserted: number
   deleted: number
   token_id: string
@@ -139,8 +136,7 @@ export type IngestEvent = {
 
 export type RowsResponse = {
   dataset_id: string
-  table: string
-  hot_window_seconds: number
+  cooling: CoolingSpec
   rows: Record<string, unknown>[]
 }
 

@@ -34,18 +34,15 @@ export function showError(error: Error) {
   toast.error(error.message)
 }
 
-// Data timestamps arrive as RFC 3339 strings (they are data, not bookkeeping),
-// while bookkeeping timestamps arrive as epoch seconds.
-export function formatStamp(instant?: string | null, locale?: string) {
-  if (!instant) return "—"
-  const date = new Date(instant)
-  if (Number.isNaN(date.getTime())) return instant
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }).format(date)
-}
-
-export function formatWindow(seconds: number) {
-  if (!seconds) return "0"
-  if (seconds % 86_400 === 0) return `${seconds / 86_400}d`
-  if (seconds % 3600 === 0) return `${seconds / 3600}h`
-  return `${Math.round(seconds / 60)}m`
+// Ranges are shown inline, so they use the short date+time form instead of the
+// medium one; a full timestamp would be truncated in half a card.
+export function formatRange(from?: string | null, to?: string | null, locale?: string) {
+  const short = (instant?: string | null) => {
+    if (!instant) return "—"
+    const date = new Date(instant)
+    return Number.isNaN(date.getTime())
+      ? instant
+      : new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(date)
+  }
+  return `${short(from)} → ${short(to)}`
 }

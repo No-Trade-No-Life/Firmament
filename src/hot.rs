@@ -1,9 +1,10 @@
 //! The hot side of a dataset: one writable `SQLite` database per dataset.
 //!
-//! The hot database holds the window that is still mutable. Rows leave it the
-//! moment they cool past the dataset's hot window: they are exported to cold
-//! Parquet first, then deleted here. Dataset ids are validated identifiers, so
-//! they are also safe path segments.
+//! The hot database holds the rows that are still mutable. A dataset is one
+//! table, so the database holds exactly one `data` table (plus its indexes).
+//! Rows leave it the moment they cool past the current period: they are
+//! exported to cold Parquet first, then deleted here. Dataset ids are validated
+//! identifiers, so they are also safe path segments.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,14 +14,13 @@ use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value as Json};
 
-use crate::schema::{self, ColumnSpec, TableSpec, Value};
+use crate::cooling::{self, CoolingSpec};
+use crate::schema::{self, ColumnSpec, HOT_TABLE, TableSpec, Value};
 
-/// Per-table state of the hot window.
+/// State of the hot store of one dataset.
 #[derive(Clone, Debug, Serialize)]
-pub struct TableStat {
-    /// Table name.
-    pub table: String,
-    /// Rows currently in the hot window.
+pub struct HotStat {
+    /// Rows currently in the hot store.
     pub rows: i64,
     /// Rows old enough to be flushed on the next cooling pass.
     pub coolable_rows: i64,
@@ -96,20 +96,20 @@ impl HotStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file or its tables cannot be created.
-    pub fn create(&self, dataset_id: &str, tables: &[TableSpec]) -> Result<(), HotError> {
-        self.apply_schema(dataset_id, tables)
+    /// Returns an error when the file or its table cannot be created.
+    pub fn create(&self, dataset_id: &str, table: &TableSpec) -> Result<(), HotError> {
+        self.apply_schema(dataset_id, table)
     }
 
-    /// Creates any missing table of a dataset, leaving existing data untouched.
+    /// Creates the missing hot table of a dataset, leaving existing rows alone.
     ///
     /// # Errors
     ///
     /// Returns an error when the hot database cannot be opened or written.
-    pub fn apply_schema(&self, dataset_id: &str, tables: &[TableSpec]) -> Result<(), HotError> {
+    pub fn apply_schema(&self, dataset_id: &str, table: &TableSpec) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
-        for statement in schema::create_statements(tables) {
+        for statement in schema::create_statements(table) {
             guard.execute_batch(&statement)?;
         }
         Ok(())
@@ -177,8 +177,7 @@ impl HotStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let statement = format!(
-                "INSERT INTO \"{}\" (\"_flush\", {names}) VALUES ({placeholders}) ON CONFLICT ({key}) DO UPDATE SET {}, \"_flush\" = NULL",
-                table.name,
+                "INSERT INTO \"{HOT_TABLE}\" (\"_flush\", {names}) VALUES ({placeholders}) ON CONFLICT ({key}) DO UPDATE SET {}, \"_flush\" = NULL",
                 updates.join(", ")
             );
             let mut prepared = transaction.prepare(&statement)?;
@@ -198,7 +197,7 @@ impl HotStore {
                 .map(|(index, name)| format!("\"{name}\" = ?{}", index + 1))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let statement = format!("DELETE FROM \"{}\" WHERE {predicate}", table.name);
+            let statement = format!("DELETE FROM \"{HOT_TABLE}\" WHERE {predicate}");
             let mut prepared = transaction.prepare(&statement)?;
             for values in keys {
                 if prepared.execute(params_from_iter(values.iter().map(Value::to_sql)))? > 0 {
@@ -210,50 +209,38 @@ impl HotStore {
         Ok(counts)
     }
 
-    /// Sums up the hot window of every table of a dataset.
+    /// Sums up the hot store of a dataset.
     ///
     /// # Errors
     ///
-    /// Returns an error when a hot table cannot be read.
+    /// Returns an error when the hot table cannot be read.
     pub fn stats(
         &self,
         dataset_id: &str,
-        tables: &[TableSpec],
-        boundaries: &HashMap<String, String>,
-    ) -> Result<Vec<TableStat>, HotError> {
+        table: &TableSpec,
+        boundary: &str,
+    ) -> Result<HotStat, HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
-        let mut stats = Vec::with_capacity(tables.len());
-        for table in tables {
-            let time = format!("\"{}\"", table.time_column);
-            let (rows, oldest, newest): (i64, Option<String>, Option<String>) = guard.query_row(
-                &format!(
-                    "SELECT COUNT(*), MIN({time}), MAX({time}) FROM \"{}\"",
-                    table.name
-                ),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            let coolable_rows = match boundaries.get(&table.name) {
-                Some(boundary) => guard.query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM \"{}\" WHERE \"_flush\" IS NULL AND {time} < ?1",
-                        table.name
-                    ),
-                    [boundary],
-                    |row| row.get(0),
-                )?,
-                None => 0,
-            };
-            stats.push(TableStat {
-                table: table.name.clone(),
-                rows,
-                coolable_rows,
-                oldest_time: oldest,
-                newest_time: newest,
-            });
-        }
-        Ok(stats)
+        let time = format!("\"{}\"", table.time_column);
+        let (rows, oldest, newest): (i64, Option<String>, Option<String>) = guard.query_row(
+            &format!("SELECT COUNT(*), MIN({time}), MAX({time}) FROM \"{HOT_TABLE}\""),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let coolable_rows = guard.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM \"{HOT_TABLE}\" WHERE \"_flush\" IS NULL AND {time} < ?1"
+            ),
+            [boundary],
+            |row| row.get(0),
+        )?;
+        Ok(HotStat {
+            rows,
+            coolable_rows,
+            oldest_time: oldest,
+            newest_time: newest,
+        })
     }
 
     /// Counts rows of one table that crossed the cooling boundary.
@@ -272,8 +259,8 @@ impl HotStore {
         guard
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM \"{}\" WHERE \"_flush\" IS NULL AND \"{}\" < ?1",
-                    table.name, table.time_column
+                    "SELECT COUNT(*) FROM \"{HOT_TABLE}\" WHERE \"_flush\" IS NULL AND \"{}\" < ?1",
+                    table.time_column
                 ),
                 [boundary],
                 |row| row.get(0),
@@ -302,8 +289,8 @@ impl HotStore {
             .collect::<Vec<_>>()
             .join(", ");
         let statement = format!(
-            "SELECT {names} FROM \"{}\" WHERE ?1 IS NULL OR \"{}\" >= ?1 ORDER BY \"{}\" ASC LIMIT ?2",
-            table.name, table.time_column, table.time_column
+            "SELECT {names} FROM \"{HOT_TABLE}\" WHERE ?1 IS NULL OR \"{}\" >= ?1 ORDER BY \"{}\" ASC LIMIT ?2",
+            table.time_column, table.time_column
         );
         let mut prepared = guard.prepare(&statement)?;
         let rows =
@@ -328,8 +315,8 @@ impl HotStore {
         let guard = lock(&connection)?;
         let changed = guard.execute(
             &format!(
-                "UPDATE \"{}\" SET \"_flush\" = ?1 WHERE \"_flush\" IS NULL AND \"{}\" < ?2",
-                table.name, table.time_column
+                "UPDATE \"{HOT_TABLE}\" SET \"_flush\" = ?1 WHERE \"_flush\" IS NULL AND \"{}\" < ?2",
+                table.time_column
             ),
             rusqlite::params![batch, boundary],
         )?;
@@ -345,6 +332,7 @@ impl HotStore {
         &self,
         dataset_id: &str,
         table: &TableSpec,
+        cooling: &CoolingSpec,
         batch: i64,
     ) -> Result<Vec<HotRow>, HotError> {
         let connection = self.connection(dataset_id)?;
@@ -357,8 +345,8 @@ impl HotStore {
             .join(", ");
         let time_index = time_index(table);
         let statement = format!(
-            "SELECT {names} FROM \"{}\" WHERE \"_flush\" = ?1 ORDER BY \"{}\" ASC",
-            table.name, table.time_column
+            "SELECT {names} FROM \"{HOT_TABLE}\" WHERE \"_flush\" = ?1 ORDER BY \"{}\" ASC",
+            table.time_column
         );
         let mut prepared = guard.prepare(&statement)?;
         let rows = prepared.query_map([batch], |row| read_row(row, table))?;
@@ -366,17 +354,12 @@ impl HotStore {
             .into_iter()
             .map(|values| {
                 let Value::Timestamp(timestamp) = &values[time_index] else {
-                    return Err(HotError::Invalid(format!(
-                        "table {} holds a row without a timestamp",
-                        table.name
-                    )));
+                    return Err(HotError::Invalid(
+                        "the hot table holds a row without a timestamp".to_owned(),
+                    ));
                 };
-                let bucket = table.granularity.bucket(timestamp).ok_or_else(|| {
-                    HotError::Invalid(format!(
-                        "table {} holds an unparsable timestamp {timestamp}",
-                        table.name
-                    ))
-                })?;
+                let bucket = cooling::bucket(table.granularity, cooling, timestamp)
+                    .map_err(HotError::Invalid)?;
                 Ok(HotRow {
                     values: values.clone(),
                     bucket,
@@ -390,14 +373,11 @@ impl HotStore {
     /// # Errors
     ///
     /// Returns an error when the release cannot be written.
-    pub fn release(&self, dataset_id: &str, table: &TableSpec, batch: i64) -> Result<(), HotError> {
+    pub fn release(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         guard.execute(
-            &format!(
-                "UPDATE \"{}\" SET \"_flush\" = NULL WHERE \"_flush\" = ?1",
-                table.name
-            ),
+            &format!("UPDATE \"{HOT_TABLE}\" SET \"_flush\" = NULL WHERE \"_flush\" = ?1"),
             [batch],
         )?;
         Ok(())
@@ -412,23 +392,15 @@ impl HotStore {
     /// # Errors
     ///
     /// Returns an error when the cleanup cannot be written.
-    pub fn purge_stale_claims(
-        &self,
-        dataset_id: &str,
-        tables: &[TableSpec],
-        batch: i64,
-    ) -> Result<(), HotError> {
+    pub fn purge_stale_claims(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
-        for table in tables {
-            guard.execute(
-                &format!(
-                    "DELETE FROM \"{}\" WHERE \"_flush\" IS NOT NULL AND \"_flush\" < ?1",
-                    table.name
-                ),
-                [batch],
-            )?;
-        }
+        guard.execute(
+            &format!(
+                "DELETE FROM \"{HOT_TABLE}\" WHERE \"_flush\" IS NOT NULL AND \"_flush\" < ?1"
+            ),
+            [batch],
+        )?;
         Ok(())
     }
 
@@ -437,11 +409,11 @@ impl HotStore {
     /// # Errors
     ///
     /// Returns an error when the deletion cannot be written.
-    pub fn purge(&self, dataset_id: &str, table: &TableSpec, batch: i64) -> Result<(), HotError> {
+    pub fn purge(&self, dataset_id: &str, batch: i64) -> Result<(), HotError> {
         let connection = self.connection(dataset_id)?;
         let guard = lock(&connection)?;
         guard.execute(
-            &format!("DELETE FROM \"{}\" WHERE \"_flush\" = ?1", table.name),
+            &format!("DELETE FROM \"{HOT_TABLE}\" WHERE \"_flush\" = ?1"),
             [batch],
         )?;
         Ok(())
@@ -517,6 +489,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::HotStore;
+    use crate::cooling::CoolingSpec;
     use crate::schema::{ColumnSpec, ColumnType, Granularity, TableSpec};
 
     fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
@@ -529,7 +502,6 @@ mod tests {
 
     fn klines() -> TableSpec {
         TableSpec {
-            name: "klines".to_owned(),
             primary_key: vec!["symbol".to_owned(), "updated_at".to_owned()],
             time_column: "updated_at".to_owned(),
             granularity: Granularity::Day,
@@ -544,7 +516,7 @@ mod tests {
     fn store() -> (TempDir, HotStore) {
         let state = TempDir::new().expect("state directory");
         let store = HotStore::new(state.path().to_path_buf()).expect("store");
-        store.create("demo", &[klines()]).expect("schema");
+        store.create("demo", &klines()).expect("schema");
         (state, store)
     }
 
@@ -597,13 +569,15 @@ mod tests {
                 .expect("claim"),
             1
         );
-        let claimed = store.claimed("demo", &table, 3).expect("claimed");
+        let claimed = store
+            .claimed("demo", &table, &CoolingSpec::default(), 3)
+            .expect("claimed");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].bucket, "2026-09-01");
-        store.release("demo", &table, 3).expect("release");
+        store.release("demo", 3).expect("release");
         assert!(
             store
-                .claimed("demo", &table, 3)
+                .claimed("demo", &table, &CoolingSpec::default(), 3)
                 .expect("claimed")
                 .is_empty()
         );
@@ -635,7 +609,7 @@ mod tests {
             .expect("rewrite");
         assert!(
             store
-                .claimed("demo", &table, 1)
+                .claimed("demo", &table, &CoolingSpec::default(), 1)
                 .expect("claimed")
                 .is_empty(),
             "a rewrite clears the claim so the new version is flushed again"

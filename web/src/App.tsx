@@ -3,17 +3,18 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useAuthMini } from "auth-mini-react-components"
 import { LinkitProvider, useLinkit } from "linkit-react-components"
 import { Navigate, Route, Routes, useLocation } from "react-router-dom"
-import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, KeyRoundIcon, LayoutDashboardIcon, RefreshCwIcon } from "lucide-react"
+import { BotIcon, DatabaseIcon, HardDriveDownloadIcon, HardDriveIcon, KeyRoundIcon, LanguagesIcon, LayoutDashboardIcon, RefreshCwIcon } from "lucide-react"
 import { AppLayout, type AppNavGroup } from "@zccz14/ux"
 
 import { FirmamentMark } from "./components/firmament-mark"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { request, type AuthSdk } from "./lib/api"
-import { copy, initialLocale, negotiateLocale, persistLocale, type Copy, type Locale } from "./lib/i18n"
+import { copy, initialLocale, negotiateLocale, persistLocale, storedLocale, type Copy, type Locale } from "./lib/i18n"
 import type { LinkitStatus, Me } from "./lib/types"
 import { DatasetPage } from "./pages/dataset-page"
 import { DatasetsPage } from "./pages/datasets-page"
@@ -28,23 +29,39 @@ export default function App() {
   const { isReady, isAuthenticated, sdk } = useAuthMini()
   const [locale, setLocale] = useState<Locale>(initialLocale)
   useEffect(() => {
-    persistLocale(locale)
     document.documentElement.lang = locale === "zh" ? "zh-CN" : "en"
   }, [locale])
   const t = copy[locale]
   if (!isReady || !isAuthenticated || !sdk) return <div className="grid min-h-svh place-items-center text-sm text-muted-foreground">{t.signin}</div>
-  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><LinkitAutoEnsure auth={sdk} /><FirmamentShell auth={sdk} locale={locale} t={t} /></LinkitProvider>
+  return <LinkitProvider linkitBaseUrl="https://linkit.ntnl.io" lang={locale}><LinkitLanguageSync setLocale={setLocale} /><LinkitAutoEnsure auth={sdk} /><FirmamentShell auth={sdk} locale={locale} setLocale={setLocale} t={t} /></LinkitProvider>
 }
 
-// The signed-in Linkit profile owns the language preference; follow it
-// instead of rendering a separate switcher in the application header.
+// Until the user picks a language by hand, follow the Linkit profile; a stored
+// choice always wins, so the header switcher is the last word.
 function LinkitLanguageSync({ setLocale }: { setLocale: (locale: Locale) => void }) {
   const { languages } = useLinkit()
   useEffect(() => {
+    if (storedLocale()) return
     const next = negotiateLocale(languages)
     if (next) setLocale(next)
   }, [languages, setLocale])
   return null
+}
+
+function LanguageButton({ locale, setLocale }: { locale: Locale; setLocale: (locale: Locale) => void }) {
+  const choose = (next: Locale) => {
+    persistLocale(next)
+    setLocale(next)
+  }
+  return <DropdownMenu>
+    <DropdownMenuTrigger className={buttonVariants({ variant: "ghost", size: "icon-sm" })} aria-label="Language">
+      <LanguagesIcon />
+    </DropdownMenuTrigger>
+    <DropdownMenuContent align="end">
+      <DropdownMenuItem onClick={() => choose("zh")} aria-current={locale === "zh"}>中文</DropdownMenuItem>
+      <DropdownMenuItem onClick={() => choose("en")} aria-current={locale === "en"}>English</DropdownMenuItem>
+    </DropdownMenuContent>
+  </DropdownMenu>
 }
 
 // Firmament keeps one Linkit Bot per user; this silent call provisions or
@@ -65,7 +82,7 @@ function LinkitAutoEnsure({ auth }: { auth: AuthSdk }) {
   return null
 }
 
-function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t: Copy }) {
+function FirmamentShell({ auth, locale, setLocale, t }: { auth: AuthSdk; locale: Locale; setLocale: (locale: Locale) => void; t: Copy }) {
   const { resolvedTheme } = useLinkit()
   const queryClient = useQueryClient()
   const location = useLocation()
@@ -98,7 +115,7 @@ function FirmamentShell({ auth, locale, t }: { auth: AuthSdk; locale: Locale; t:
         title={t.appName}
         nav={nav}
         pageTitle={pageTitle(location.pathname, t)}
-        headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button></div>}
+        headerSlot={<div className="flex items-center gap-1">{me.data.is_root && <Badge variant="outline">{t.root}</Badge>}<LanguageButton locale={locale} setLocale={setLocale} /><Button variant="ghost" size="icon-sm" onClick={refresh} aria-label={t.refresh}><RefreshCwIcon /></Button></div>}
       >
         <Routes>
           <Route path="/" element={<OverviewPage auth={auth} t={t} />} />
