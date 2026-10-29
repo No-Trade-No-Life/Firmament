@@ -32,7 +32,7 @@ const zh = {
   retry: "重试",
 
   overviewTitle: "数据天穹",
-  overviewSubtitle: "每个数据集就是一张可写的热表，加上一份只追加的 Parquet 历史。早于当前周期的数据冷却进冷库，供下游镜像。",
+  overviewSubtitle: "每个数据集就是一张可写的热表，加上一份按桶重写的 Parquet 历史。早于当前周期的数据冷却进冷库，供下游镜像。",
   statDatasets: "数据集",
   statHotRows: "热库行数",
   statColdFiles: "冷库文件",
@@ -44,7 +44,7 @@ const zh = {
   quickStart3: "早于当前周期的行自动冷却成 Parquet；下游用同步器增量镜像到本地，自己读。",
 
   datasetsTitle: "数据集",
-  datasetsDescription: "一个数据集 = 一张声明好的表 + 一个可写的热库 + 一棵只追加的冷库树。",
+  datasetsDescription: "一个数据集 = 一张声明好的表 + 一个可写的热库 + 一棵按桶重写的冷库树。",
   noDatasets: "还没有数据集",
   newDataset: "新建数据集",
   datasetId: "数据集 ID",
@@ -244,7 +244,7 @@ const en: typeof zh = {
   retry: "Retry",
 
   overviewTitle: "The data firmament",
-  overviewSubtitle: "Every dataset is one writable hot table plus an append-only Parquet history. Anything older than the current period cools into cold storage, which downstream mirrors.",
+  overviewSubtitle: "Every dataset is one writable hot table plus a Parquet history rewritten one bucket at a time. Anything older than the current period cools into cold storage, which downstream mirrors.",
   statDatasets: "Datasets",
   statHotRows: "Rows in hot store",
   statColdFiles: "Cold files",
@@ -256,7 +256,7 @@ const en: typeof zh = {
   quickStart3: "Rows older than the current period cool into Parquet; downstream mirrors them incrementally and reads them with its own tools.",
 
   datasetsTitle: "Datasets",
-  datasetsDescription: "A dataset is one declared table, a writable hot store, and an append-only cold tree.",
+  datasetsDescription: "A dataset is one declared table, a writable hot store, and a cold tree rewritten one bucket at a time.",
   noDatasets: "No datasets yet",
   newDataset: "New dataset",
   datasetId: "Dataset ID",
