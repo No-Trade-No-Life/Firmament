@@ -46,14 +46,20 @@ function ColdStorageCard({ auth, t }: { auth: AuthSdk; t: Copy }) {
   const settings = useQuery({ queryKey: ["cold-settings"], queryFn: () => request<ColdSettings>("/api/v1/cold", auth) })
   const [bucket, setBucket] = useState("")
   const [region, setRegion] = useState("")
+  const [endpoint, setEndpoint] = useState("")
+  const [accessKeyId, setAccessKeyId] = useState("")
+  const [secretAccessKey, setSecretAccessKey] = useState("")
   useEffect(() => {
     if (settings.data) {
       setBucket(settings.data.bucket)
       setRegion(settings.data.region)
+      setEndpoint(settings.data.endpoint ?? "")
+      setAccessKeyId(settings.data.access_key_id ?? "")
+      setSecretAccessKey("")
     }
   }, [settings.data])
   const save = useMutation({
-    mutationFn: () => request<ColdSettings>("/api/v1/cold", auth, { method: "PUT", body: JSON.stringify({ bucket, region }) }),
+    mutationFn: () => request<ColdSettings>("/api/v1/cold", auth, { method: "PUT", body: JSON.stringify({ bucket, region, endpoint, access_key_id: accessKeyId, secret_access_key: secretAccessKey }) }),
     onSuccess: () => { toast.success(t.coldSaved); void queryClient.invalidateQueries({ queryKey: ["cold-settings"] }) },
     onError: showError,
   })
@@ -65,6 +71,11 @@ function ColdStorageCard({ auth, t }: { auth: AuthSdk; t: Copy }) {
         <div className="grid gap-4 sm:grid-cols-2">
           <Field><FieldLabel htmlFor="cold-bucket">{t.coldBucket}</FieldLabel><Input id="cold-bucket" value={bucket} onChange={(event) => setBucket(event.target.value)} /></Field>
           <Field><FieldLabel htmlFor="cold-region">{t.coldRegion}</FieldLabel><Input id="cold-region" value={region} onChange={(event) => setRegion(event.target.value)} /></Field>
+        </div>
+        <Field><FieldLabel htmlFor="cold-endpoint">{t.coldEndpoint}</FieldLabel><Input id="cold-endpoint" value={endpoint} placeholder="https://<account>.r2.cloudflarestorage.com" onChange={(event) => setEndpoint(event.target.value)} /></Field>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field><FieldLabel htmlFor="cold-access-key">{t.coldAccessKey}</FieldLabel><Input id="cold-access-key" value={accessKeyId} onChange={(event) => setAccessKeyId(event.target.value)} /></Field>
+          <Field><FieldLabel htmlFor="cold-secret-key">{t.coldSecretKey}</FieldLabel><Input id="cold-secret-key" type="password" value={secretAccessKey} placeholder={settings.data.has_secret ? t.coldSecretStored : ""} onChange={(event) => setSecretAccessKey(event.target.value)} /></Field>
         </div>
       </FieldGroup>
       <div><Button size="sm" disabled={save.isPending || bucket === "" || region === ""} onClick={() => save.mutate()}>{save.isPending ? t.saving : t.save}</Button></div>

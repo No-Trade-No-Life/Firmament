@@ -1,12 +1,12 @@
-//! The cold side: an append-only Parquet tree in object storage.
+//! The cold side: one Parquet object per bucket in S3-compatible storage.
 //!
-//! Objects are written once and never rewritten. That is what makes an
-//! incremental mirror trivially correct: a mirror only ever adds files, and a
-//! file it already has can never become stale.
+//! A partition is a full snapshot of its bucket, so a rewrite replaces the whole
+//! object and the manifest moves forward by revision. The tree stays readable
+//! without this application: object names are bucket names, and `glob` is the
+//! index.
 //!
-//! Besides the data itself, every batch writes a small immutable catalogue
-//! object next to it, so the cold tree stays readable even if this application
-//! is gone.
+//! The store is anything the S3 API reaches -- AWS S3 through the instance role,
+//! or Cloudflare R2 through an explicit endpoint and static keys.
 
 use std::sync::Arc;
 
@@ -17,16 +17,16 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{
+    Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::db::{
-    DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, META_COLD_BUCKET,
-    META_COLD_REGION,
-};
+use crate::db::{ColdSettings, Database, DatabaseError};
+use crate::files::sha256_hex;
 use crate::schema::{ColumnSpec, ColumnType, TableSpec, Value};
 
 #[derive(Debug, Error)]
@@ -75,8 +75,9 @@ pub struct S3ColdStore {
 }
 
 struct CachedClient {
+    /// Identifies the settings the client was built from.
+    fingerprint: String,
     bucket: String,
-    region: String,
     client: Client,
 }
 
@@ -89,32 +90,61 @@ impl S3ColdStore {
     }
 
     async fn client(&self) -> Result<(String, Client), ColdError> {
-        let bucket = self
-            .database
-            .meta_value(META_COLD_BUCKET)?
-            .unwrap_or_else(|| DEFAULT_COLD_BUCKET.to_owned());
-        let region = self
-            .database
-            .meta_value(META_COLD_REGION)?
-            .unwrap_or_else(|| DEFAULT_COLD_REGION.to_owned());
+        let settings = self.database.cold_settings()?;
+        let fingerprint = settings_fingerprint(&settings);
         if let Some(cached) = self.cache.read().await.as_ref()
-            && cached.bucket == bucket
-            && cached.region == region
+            && cached.fingerprint == fingerprint
         {
-            return Ok((bucket, cached.client.clone()));
+            return Ok((cached.bucket.clone(), cached.client.clone()));
         }
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region.clone()))
-            .load()
-            .await;
-        let client = Client::new(&config);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new(settings.region.clone()));
+        if let (Some(access_key_id), Some(secret_access_key)) =
+            (&settings.access_key_id, &settings.secret_access_key)
+        {
+            loader = loader.credentials_provider(Credentials::new(
+                access_key_id.clone(),
+                secret_access_key.clone(),
+                None,
+                None,
+                "firmament",
+            ));
+        }
+        if let Some(endpoint) = &settings.endpoint {
+            loader = loader.endpoint_url(endpoint);
+        }
+        let shared = loader.load().await;
+        let client = Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&shared)
+                // An S3-compatible store has no bucket subdomains to route on, and
+                // the newer SDK checksums are not part of the compatibility
+                // surface every implementation ships.
+                .force_path_style(settings.endpoint.is_some())
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+                .build(),
+        );
         *self.cache.write().await = Some(CachedClient {
-            bucket: bucket.clone(),
-            region,
+            fingerprint,
+            bucket: settings.bucket.clone(),
             client: client.clone(),
         });
-        Ok((bucket, client))
+        Ok((settings.bucket, client))
     }
+}
+
+/// Identifies the client-affecting parts of the settings; any change rebuilds
+/// the client on the next request.
+fn settings_fingerprint(settings: &ColdSettings) -> String {
+    let joined = [
+        settings.bucket.as_str(),
+        settings.region.as_str(),
+        settings.endpoint.as_deref().unwrap_or_default(),
+        settings.access_key_id.as_deref().unwrap_or_default(),
+        settings.secret_access_key.as_deref().unwrap_or_default(),
+    ]
+    .join("\u{0}");
+    sha256_hex(joined.as_bytes())
 }
 
 fn sdk_message(error: impl std::fmt::Display) -> ColdError {

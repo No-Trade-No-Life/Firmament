@@ -24,8 +24,8 @@ use crate::cold::{self, ColdStore, object_key};
 use crate::cooling::Cadence;
 use crate::crypto::write_token_secret;
 use crate::db::{
-    DEFAULT_COLD_BUCKET, DEFAULT_COLD_REGION, Database, DatabaseError, Flush, IngestEvent,
-    LinkitStatus, META_COLD_BUCKET, META_COLD_REGION, Syncer, WriteToken, WriteTokenCreated,
+    ColdSettings, Database, DatabaseError, Flush, IngestEvent, LinkitStatus, Syncer, WriteToken,
+    WriteTokenCreated,
 };
 use crate::files::sha256_hex;
 use crate::flush::cooling_boundary;
@@ -773,6 +773,21 @@ async fn test_linkit(
 struct ColdSettingsView {
     bucket: String,
     region: String,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    has_secret: bool,
+}
+
+impl From<ColdSettings> for ColdSettingsView {
+    fn from(settings: ColdSettings) -> Self {
+        Self {
+            bucket: settings.bucket,
+            region: settings.region,
+            endpoint: settings.endpoint,
+            access_key_id: settings.access_key_id,
+            has_secret: settings.secret_access_key.is_some(),
+        }
+    }
 }
 
 async fn get_cold_settings(
@@ -780,22 +795,19 @@ async fn get_cold_settings(
     Extension(principal): Extension<AuthMiniPrincipal>,
 ) -> Result<Json<ColdSettingsView>, ApiError> {
     Actor::from_principal(&state.database, &principal)?.assert_root()?;
-    Ok(Json(ColdSettingsView {
-        bucket: state
-            .database
-            .meta_value(META_COLD_BUCKET)?
-            .unwrap_or_else(|| DEFAULT_COLD_BUCKET.to_owned()),
-        region: state
-            .database
-            .meta_value(META_COLD_REGION)?
-            .unwrap_or_else(|| DEFAULT_COLD_REGION.to_owned()),
-    }))
+    Ok(Json(state.database.cold_settings()?.into()))
 }
 
 #[derive(Debug, Deserialize)]
 struct ColdSettingsInput {
     bucket: String,
     region: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    access_key_id: String,
+    #[serde(default)]
+    secret_access_key: String,
 }
 
 async fn put_cold_settings(
@@ -820,9 +832,43 @@ async fn put_cold_settings(
     if !bucket_ok || !region_ok {
         return Err(ApiError::bad_request("invalid cold storage settings"));
     }
-    state.database.put_meta_value(META_COLD_BUCKET, &bucket)?;
-    state.database.put_meta_value(META_COLD_REGION, &region)?;
-    Ok(Json(ColdSettingsView { bucket, region }))
+    let endpoint = input.endpoint.trim().trim_end_matches('/').to_owned();
+    let endpoint_ok =
+        endpoint.is_empty() || endpoint.starts_with("https://") || endpoint.starts_with("http://");
+    if !endpoint_ok {
+        return Err(ApiError::bad_request(
+            "the cold endpoint must be an http(s) URL",
+        ));
+    }
+    let access_key_id = input.access_key_id.trim().to_owned();
+    let secret_access_key = input.secret_access_key.trim().to_owned();
+    let existing = state.database.cold_settings()?;
+    let mut settings = ColdSettings {
+        bucket,
+        region,
+        endpoint: (!endpoint.is_empty()).then_some(endpoint),
+        access_key_id: None,
+        secret_access_key: None,
+    };
+    if !access_key_id.is_empty() {
+        let rotated = existing.access_key_id.as_deref() != Some(access_key_id.as_str());
+        let secret = match (secret_access_key.is_empty(), rotated) {
+            (false, _) => secret_access_key,
+            // Keeping the stored secret is only meaningful for the same key.
+            (true, false) => existing
+                .secret_access_key
+                .ok_or_else(|| ApiError::bad_request("the secret key is required"))?,
+            (true, true) => {
+                return Err(ApiError::bad_request(
+                    "a secret key is required with a new access key id",
+                ));
+            }
+        };
+        settings.access_key_id = Some(access_key_id);
+        settings.secret_access_key = Some(secret);
+    }
+    state.database.save_cold_settings(&settings)?;
+    Ok(Json(state.database.cold_settings()?.into()))
 }
 
 async fn system_resources(

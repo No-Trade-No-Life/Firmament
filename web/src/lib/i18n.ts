@@ -120,6 +120,10 @@ const zh = {
   coldStorageDescription: "冷却把早于当前周期的行导出成 Parquet 存进 S3；某个分区有了新数据，就整块重写。",
   coldBucket: "存储桶",
   coldRegion: "区域",
+  coldEndpoint: "S3 端点（留空则用 AWS S3）",
+  coldAccessKey: "Access Key ID",
+  coldSecretKey: "Secret Access Key",
+  coldSecretStored: "已保存，留空表示不修改",
   coldSaved: "冷库配置已保存",
 
   ingestTitle: "接入与审计",
@@ -332,6 +336,10 @@ const en: typeof zh = {
   coldStorageDescription: "Cooling exports rows older than the current period as Parquet in S3; a partition is rewritten whole whenever it gains rows.",
   coldBucket: "Bucket",
   coldRegion: "Region",
+  coldEndpoint: "S3 endpoint (empty for AWS S3)",
+  coldAccessKey: "Access Key ID",
+  coldSecretKey: "Secret Access Key",
+  coldSecretStored: "Stored — leave blank to keep",
   coldSaved: "Cold storage settings saved",
 
   ingestTitle: "Ingest and audit",
